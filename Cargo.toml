@@ -1,6 +1,6 @@
 [package]
 name = "gsd"
-version = "0.1.0"
+version = "0.0.0"
 edition = "2021"
 description = "Git snapshot daemon - automatic versioning of monitored directories"
 license = "MIT"
