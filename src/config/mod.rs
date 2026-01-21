@@ -2,7 +2,15 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
-const DEFAULT_CONFIG_PATH: &str = "/etc/gsd/config.toml";
+/// Get the XDG config path (~/.config/gsd/config.toml)
+pub fn xdg_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("gsd").join("config.toml"))
+}
+
+/// Get the default config path (XDG or fallback)
+fn default_config_path() -> PathBuf {
+    xdg_config_path().unwrap_or_else(|| PathBuf::from("/etc/gsd/config.toml"))
+}
 const DEFAULT_SCHEMA_VERSION: &str = "1";
 const DEFAULT_INTERVAL_SECONDS: u64 = 60;
 
@@ -163,8 +171,94 @@ impl Config {
         } else if let Ok(env_path) = env::var("GSD_CONFIG") {
             (PathBuf::from(env_path), ConfigPathKind::Env)
         } else {
-            (PathBuf::from(DEFAULT_CONFIG_PATH), ConfigPathKind::Default)
+            (default_config_path(), ConfigPathKind::Default)
         }
+    }
+
+    /// Ensure config file exists, creating default if needed
+    pub fn ensure_config_exists(cli_path: Option<&Path>) -> Result<PathBuf, ConfigError> {
+        let (path, _kind) = Self::resolve_path(cli_path);
+
+        if !path.exists() {
+            // Create parent directories
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            // Write default config
+            fs::write(&path, Self::default_config_toml()).map_err(|source| ConfigError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        }
+
+        Ok(path)
+    }
+
+    /// Load config, creating default if it doesn't exist
+    pub fn load_or_create(cli_path: Option<&Path>) -> Result<(Self, PathBuf), ConfigError> {
+        let path = Self::ensure_config_exists(cli_path)?;
+
+        let raw = fs::read_to_string(&path).map_err(|source| ConfigError::Io {
+            path: path.clone(),
+            source,
+        })?;
+
+        let mut config: Config = toml::from_str(&raw).map_err(|source| ConfigError::ParseToml {
+            path: path.clone(),
+            source,
+        })?;
+
+        config.apply_env_overrides();
+        // Don't validate here - allow empty targets for new configs
+
+        Ok((config, path))
+    }
+
+    /// Save config to file
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| ConfigError::Invalid(format!("failed to serialize config: {}", e)))?;
+        fs::write(path, content).map_err(|source| ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    /// Add a target to the config
+    pub fn add_target(&mut self, target: TargetConfig) -> Result<(), ConfigError> {
+        // Check for duplicates
+        if self.targets.iter().any(|t| t.path == target.path) {
+            return Err(ConfigError::Invalid(format!(
+                "target already exists: {}",
+                target.path.display()
+            )));
+        }
+        self.targets.push(target);
+        Ok(())
+    }
+
+    /// Remove a target from the config by path
+    pub fn remove_target(&mut self, path: &Path) -> Result<TargetConfig, ConfigError> {
+        let idx = self
+            .targets
+            .iter()
+            .position(|t| t.path == path)
+            .ok_or_else(|| ConfigError::Invalid(format!("target not found: {}", path.display())))?;
+        Ok(self.targets.remove(idx))
+    }
+
+    /// Find a target by path
+    pub fn find_target(&self, path: &Path) -> Option<&TargetConfig> {
+        self.targets.iter().find(|t| t.path == path)
+    }
+
+    /// Find a target by path (mutable)
+    pub fn find_target_mut(&mut self, path: &Path) -> Option<&mut TargetConfig> {
+        self.targets.iter_mut().find(|t| t.path == path)
     }
 
     pub fn load_from_sources(cli_path: Option<&Path>) -> Result<Self, ConfigError> {
@@ -195,6 +289,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_for_daemon(false)
+    }
+
+    /// Validate config, optionally requiring at least one target (for daemon mode)
+    pub fn validate_for_daemon(&self, require_targets: bool) -> Result<(), ConfigError> {
         if self.schema_version != DEFAULT_SCHEMA_VERSION {
             return Err(ConfigError::Invalid(format!(
                 "unsupported schema_version {}, expected {}",
@@ -202,7 +301,7 @@ impl Config {
             )));
         }
 
-        if self.targets.is_empty() {
+        if require_targets && self.targets.is_empty() {
             return Err(ConfigError::Invalid(
                 "at least one target must be configured".to_string(),
             ));

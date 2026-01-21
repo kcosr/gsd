@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use tracing::{error, info};
 
-use config::{Config, ConfigError, ConfigPathKind};
+use config::{Config, ConfigError, ConfigPathKind, TargetConfig};
 use logging::LoggingSettings;
 use snapshot::SnapshotService;
 
@@ -36,19 +36,65 @@ enum Command {
     /// Run the daemon (default)
     Run,
 
-    /// Configuration management
-    Config {
-        #[command(subcommand)]
-        command: ConfigCommand,
+    /// Add a directory to monitoring (initializes .gsd and adds to config)
+    Add {
+        /// Directory path to add (defaults to current directory)
+        path: Option<PathBuf>,
+
+        /// Snapshot interval in seconds
+        #[arg(short, long, default_value = "60")]
+        interval: u64,
+
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// Remove a directory from monitoring (removes from config and deletes .gsd)
+    Remove {
+        /// Directory path to remove (defaults to current directory)
+        path: Option<PathBuf>,
+
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// Enable monitoring for a directory
+    Enable {
+        /// Directory path to enable (defaults to current directory)
+        path: Option<PathBuf>,
+    },
+
+    /// Disable monitoring for a directory
+    Disable {
+        /// Directory path to disable (defaults to current directory)
+        path: Option<PathBuf>,
+    },
+
+    /// Take a snapshot of a directory
+    Snapshot {
+        /// Directory path to snapshot (defaults to current directory)
+        path: Option<PathBuf>,
+
+        /// Commit message (auto-generated if not provided)
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+
+    /// Preview files that would be included in a snapshot
+    Preview {
+        /// Directory path to preview (defaults to current directory)
+        path: Option<PathBuf>,
     },
 
     /// Check target directories
     Check,
 
-    /// Preview files that would be included in a snapshot
-    Preview {
-        /// Directory path to preview
-        path: PathBuf,
+    /// Configuration management
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
 }
 
@@ -57,11 +103,14 @@ enum ConfigCommand {
     /// Validate configuration file
     Validate,
 
-    /// Generate default configuration
+    /// Initialize a new configuration file
     Init {
-        /// Path to write config file
-        path: PathBuf,
+        /// Path to write config file (defaults to XDG config path)
+        path: Option<PathBuf>,
     },
+
+    /// Show current configuration file path
+    Path,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +123,9 @@ enum CliError {
 
     #[error(transparent)]
     Snapshot(#[from] snapshot::SnapshotError),
+
+    #[error(transparent)]
+    Git(#[from] git::GitError),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -94,13 +146,263 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<ExitCode, CliError> {
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run_daemon(cli.config.as_deref()),
+        Command::Add {
+            path,
+            interval,
+            yes,
+        } => add_target(path, interval, yes, cli.config.as_deref()),
+        Command::Remove { path, yes } => remove_target(path, yes, cli.config.as_deref()),
+        Command::Enable { path } => set_target_enabled(path, true, cli.config.as_deref()),
+        Command::Disable { path } => set_target_enabled(path, false, cli.config.as_deref()),
+        Command::Snapshot { path, message } => take_snapshot(path, message),
+        Command::Preview { path } => {
+            let path = resolve_target_path(path)?;
+            preview_path(&path, cli.config.as_deref())
+        }
+        Command::Check => check_targets(cli.config.as_deref()),
         Command::Config { command } => match command {
             ConfigCommand::Validate => validate_config(cli.config.as_deref()),
-            ConfigCommand::Init { path } => init_config(&path),
+            ConfigCommand::Init { path } => init_config(path, cli.config.as_deref()),
+            ConfigCommand::Path => show_config_path(cli.config.as_deref()),
         },
-        Command::Check => check_targets(cli.config.as_deref()),
-        Command::Preview { path } => preview_path(&path, cli.config.as_deref()),
     }
+}
+
+/// Resolve target path, defaulting to current directory
+fn resolve_target_path(path: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    let path = path.unwrap_or_else(|| PathBuf::from("."));
+    path.canonicalize().map_err(|e| {
+        CliError::Io(std::io::Error::new(
+            e.kind(),
+            format!("cannot access '{}': {}", path.display(), e),
+        ))
+    })
+}
+
+/// Prompt for confirmation
+fn confirm(prompt: &str) -> bool {
+    use std::io::{self, Write};
+    print!("{} [y/N] ", prompt);
+    io::stdout().flush().unwrap();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+fn add_target(
+    path: Option<PathBuf>,
+    interval: u64,
+    yes: bool,
+    config_path: Option<&Path>,
+) -> Result<ExitCode, CliError> {
+    let path = resolve_target_path(path)?;
+
+    // Load or create config
+    let (mut config, config_file) = Config::load_or_create(config_path)?;
+
+    // Check if already exists
+    if config.find_target(&path).is_some() {
+        eprintln!("Error: Target already exists: {}", path.display());
+        return Ok(ExitCode::from(1));
+    }
+
+    // Confirm
+    if !yes {
+        println!("Add target: {}", path.display());
+        println!("  interval: {}s", interval);
+        println!("  config: {}", config_file.display());
+        if !confirm("Proceed?") {
+            println!("Cancelled.");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+
+    // Initialize .gsd repo
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| CliError::Io(std::io::Error::other(e)))?;
+
+    runtime.block_on(async {
+        git::ensure_repo_initialized(
+            &path,
+            &config.git.author_name,
+            &config.git.author_email,
+            &config.git.default_ignore_patterns,
+        )
+        .await
+    })?;
+
+    // Add to config
+    let target = TargetConfig {
+        path: path.clone(),
+        interval_seconds: interval,
+        ignore_patterns: Vec::new(),
+        enabled: true,
+    };
+    config.add_target(target)?;
+    config.save(&config_file)?;
+
+    println!("Added: {}", path.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn remove_target(
+    path: Option<PathBuf>,
+    yes: bool,
+    config_path: Option<&Path>,
+) -> Result<ExitCode, CliError> {
+    let path = resolve_target_path(path)?;
+
+    // Load config
+    let (mut config, config_file) = Config::load_or_create(config_path)?;
+
+    // Check if exists
+    if config.find_target(&path).is_none() {
+        eprintln!("Error: Target not found: {}", path.display());
+        return Ok(ExitCode::from(1));
+    }
+
+    let gsd_dir = path.join(git::GSD_DIR);
+    let has_gsd = gsd_dir.exists();
+
+    // Confirm
+    if !yes {
+        println!("Remove target: {}", path.display());
+        if has_gsd {
+            println!("  Will delete: {}", gsd_dir.display());
+        }
+        println!("  config: {}", config_file.display());
+        if !confirm("Proceed?") {
+            println!("Cancelled.");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+
+    // Remove from config
+    config.remove_target(&path)?;
+    config.save(&config_file)?;
+
+    // Delete .gsd directory
+    if has_gsd {
+        std::fs::remove_dir_all(&gsd_dir)?;
+        println!("Deleted: {}", gsd_dir.display());
+    }
+
+    println!("Removed: {}", path.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn set_target_enabled(
+    path: Option<PathBuf>,
+    enabled: bool,
+    config_path: Option<&Path>,
+) -> Result<ExitCode, CliError> {
+    let path = resolve_target_path(path)?;
+
+    // Load config
+    let (mut config, config_file) = Config::load_or_create(config_path)?;
+
+    // Find and update target
+    let target = config.find_target_mut(&path).ok_or_else(|| {
+        CliError::Config(ConfigError::Invalid(format!(
+            "target not found: {}",
+            path.display()
+        )))
+    })?;
+
+    if target.enabled == enabled {
+        println!(
+            "Target {} is already {}",
+            path.display(),
+            if enabled { "enabled" } else { "disabled" }
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    target.enabled = enabled;
+    config.save(&config_file)?;
+
+    println!(
+        "{}: {}",
+        if enabled { "Enabled" } else { "Disabled" },
+        path.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn take_snapshot(path: Option<PathBuf>, message: Option<String>) -> Result<ExitCode, CliError> {
+    let path = resolve_target_path(path)?;
+
+    // Check if .gsd exists
+    let gsd_dir = path.join(git::GSD_DIR);
+    if !gsd_dir.exists() {
+        eprintln!(
+            "Error: No .gsd directory found in {}. Run 'gsd add' first.",
+            path.display()
+        );
+        return Ok(ExitCode::from(1));
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| CliError::Io(std::io::Error::other(e)))?;
+
+    runtime.block_on(async {
+        // Check for changes
+        let has_changes = git::has_changes(&path).await?;
+        if !has_changes {
+            println!("No changes to snapshot.");
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        // Get changed files for auto-message
+        let changed_files = git::list_changed_files(&path).await?;
+
+        // Generate or use provided message
+        let commit_message = message.unwrap_or_else(|| {
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            if changed_files.len() <= 3 {
+                format!("Snapshot {}: {}", timestamp, changed_files.join(", "))
+            } else {
+                format!(
+                    "Snapshot {}: {} and {} more",
+                    timestamp,
+                    changed_files[..2].join(", "),
+                    changed_files.len() - 2
+                )
+            }
+        });
+
+        // Commit
+        git::commit_all(&path, &commit_message).await?;
+
+        println!("Snapshot created: {} file(s)", changed_files.len());
+        for f in &changed_files {
+            println!("  {}", f);
+        }
+
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+fn show_config_path(config_path: Option<&Path>) -> Result<ExitCode, CliError> {
+    let (path, kind) = Config::resolve_path(config_path);
+    let exists = path.exists();
+
+    println!("{}", path.display());
+    println!(
+        "  source: {}",
+        match kind {
+            ConfigPathKind::Explicit => "command line",
+            ConfigPathKind::Env => "GSD_CONFIG environment variable",
+            ConfigPathKind::Default => "default (XDG)",
+        }
+    );
+    println!("  exists: {}", exists);
+
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_daemon(config_path: Option<&std::path::Path>) -> Result<ExitCode, CliError> {
@@ -167,7 +469,10 @@ fn validate_config(config_path: Option<&std::path::Path>) -> Result<ExitCode, Cl
     Ok(ExitCode::SUCCESS)
 }
 
-fn init_config(path: &PathBuf) -> Result<ExitCode, CliError> {
+fn init_config(path: Option<PathBuf>, config_path: Option<&Path>) -> Result<ExitCode, CliError> {
+    // Use provided path, or resolve from config_path/default
+    let path = path.unwrap_or_else(|| Config::resolve_path(config_path).0);
+
     if path.exists() {
         eprintln!(
             "Config file {} already exists; refusing to overwrite.",
@@ -183,7 +488,7 @@ fn init_config(path: &PathBuf) -> Result<ExitCode, CliError> {
         }
     }
 
-    std::fs::write(path, Config::default_config_toml())?;
+    std::fs::write(&path, Config::default_config_toml())?;
     println!("Wrote default config to {}", path.display());
 
     Ok(ExitCode::SUCCESS)

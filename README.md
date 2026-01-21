@@ -42,23 +42,46 @@ gsd
 ### Commands
 
 ```bash
-# Run the daemon (default)
-gsd run
+# Add current directory to monitoring (initializes .gsd, adds to config)
+gsd add
+gsd add /path/to/dir
+gsd add -y                    # Skip confirmation
+gsd add -i 300                # Set interval to 5 minutes
 
-# Validate configuration
-gsd config validate
+# Remove directory from monitoring (deletes .gsd, removes from config)
+gsd remove
+gsd remove /path/to/dir
+gsd remove -y                 # Skip confirmation
 
-# Generate default configuration
-gsd config init /etc/gsd/config.toml
+# Enable/disable monitoring
+gsd enable
+gsd disable
 
-# Check target directories before running
-gsd check
+# Take a manual snapshot
+gsd snapshot
+gsd snapshot -m "My message"
 
 # Preview files that would be included in a snapshot
-gsd preview /path/to/directory
+gsd preview
+gsd preview /path/to/dir
+
+# Run the daemon
+gsd run
+
+# Check target directories
+gsd check
+
+# Configuration management
+gsd config path               # Show config file location
+gsd config init               # Create default config at XDG path
+gsd config validate           # Validate configuration
 ```
 
 ## Configuration
+
+Configuration is stored at `~/.config/gsd/config.toml` by default (XDG). Override with `--config` or `GSD_CONFIG` environment variable.
+
+The config file is auto-created when you run `gsd add` for the first time.
 
 ### Example config.toml
 
