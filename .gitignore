@@ -1,0 +1,8 @@
+# Build
+/target
+
+# Build service
+.build-service/workspace-id
+
+# Codemap
+.codemap/
