@@ -406,7 +406,7 @@ fn show_config_path(config_path: Option<&Path>) -> Result<ExitCode, CliError> {
 }
 
 fn run_daemon(config_path: Option<&std::path::Path>) -> Result<ExitCode, CliError> {
-    let config = load_config(config_path)?;
+    let (config, resolved_path) = load_config_with_path(config_path)?;
 
     // Initialize logging
     let logging_settings = LoggingSettings::from_config(&config.logging)?;
@@ -415,6 +415,7 @@ fn run_daemon(config_path: Option<&std::path::Path>) -> Result<ExitCode, CliErro
     info!(
         version = env!("CARGO_PKG_VERSION"),
         targets = config.targets.len(),
+        config = %resolved_path.display(),
         "Starting gsd"
     );
 
@@ -425,7 +426,7 @@ fn run_daemon(config_path: Option<&std::path::Path>) -> Result<ExitCode, CliErro
         .map_err(|e| CliError::Io(std::io::Error::other(e)))?;
 
     runtime.block_on(async {
-        let mut service = SnapshotService::new(config);
+        let mut service = SnapshotService::new(config, Some(resolved_path));
 
         service.initialize().await?;
 
@@ -818,10 +819,14 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
 }
 
 fn load_config(path: Option<&std::path::Path>) -> Result<Config, CliError> {
+    load_config_with_path(path).map(|(cfg, _)| cfg)
+}
+
+fn load_config_with_path(path: Option<&std::path::Path>) -> Result<(Config, PathBuf), CliError> {
     let (resolved_path, kind) = Config::resolve_path(path);
 
     match Config::load_from_sources(path) {
-        Ok(cfg) => Ok(cfg),
+        Ok(cfg) => Ok((cfg, resolved_path)),
         Err(ConfigError::Io { ref source, .. })
             if source.kind() == std::io::ErrorKind::NotFound
                 && matches!(kind, ConfigPathKind::Default) =>
@@ -832,8 +837,8 @@ fn load_config(path: Option<&std::path::Path>) -> Result<Config, CliError> {
                  To fix:\n  \
                  - Pass --config <path>, or\n  \
                  - Set GSD_CONFIG env var, or\n  \
-                 - Run: git-snapshotd config init {}",
-                resolved_path.display(),
+                 - Run: gsd add <path>, or\n  \
+                 - Run: gsd config init",
                 resolved_path.display(),
             );
             Err(CliError::Config(ConfigError::Invalid(

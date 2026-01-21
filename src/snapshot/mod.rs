@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -17,15 +18,16 @@ use crate::git::{
 struct TargetState {
     config: TargetConfig,
     in_flight: bool,
+    task_handle: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug)]
 pub struct SnapshotService {
     config: Config,
+    config_path: Option<PathBuf>,
     targets: Arc<RwLock<HashMap<String, TargetState>>>,
     shutdown_tx: Option<mpsc::Sender<()>>,
     shutdown_rx: Option<mpsc::Receiver<()>>,
-    task_handles: Vec<JoinHandle<()>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,14 +55,14 @@ fn format_commit_message(files: &[String], max_files: usize) -> String {
 }
 
 impl SnapshotService {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, config_path: Option<PathBuf>) -> Self {
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         Self {
             config,
+            config_path,
             targets: Arc::new(RwLock::new(HashMap::new())),
             shutdown_tx: Some(shutdown_tx),
             shutdown_rx: Some(shutdown_rx),
-            task_handles: Vec::new(),
         }
     }
 
@@ -110,6 +112,7 @@ impl SnapshotService {
                         TargetState {
                             config: target.clone(),
                             in_flight: false,
+                            task_handle: None,
                         },
                     );
                     initialized_count += 1;
@@ -145,41 +148,232 @@ impl SnapshotService {
         // Initial commit check for all targets
         self.commit_all_targets().await;
 
-        // Spawn timer tasks for each target
-        let targets = self.targets.read().await;
-        for (id, state) in targets.iter() {
-            let target_id = id.clone();
-            let interval = Duration::from_secs(state.config.interval_seconds);
-            let targets_ref = Arc::clone(&self.targets);
-            let path = state.config.path.clone();
+        // Start timer tasks for all targets
+        self.start_all_target_tasks().await;
 
-            let handle = tokio::spawn(async move {
-                let mut interval_timer = tokio::time::interval(interval);
-                interval_timer.tick().await; // Skip immediate first tick
-
-                loop {
-                    interval_timer.tick().await;
-                    Self::commit_target_static(&targets_ref, &target_id, &path).await;
-                }
-            });
-
-            self.task_handles.push(handle);
-        }
-        drop(targets);
+        // Set up config file watcher
+        let (reload_tx, mut reload_rx) = mpsc::channel::<()>(1);
+        let _watcher = self.setup_config_watcher(reload_tx);
 
         info!("Snapshot service running, waiting for shutdown signal");
 
-        // Wait for shutdown
-        shutdown_rx.recv().await;
-
-        info!("Shutdown signal received, stopping tasks");
-
-        // Cancel all tasks
-        for handle in self.task_handles.drain(..) {
-            handle.abort();
+        // Main event loop
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    info!("Shutdown signal received, stopping tasks");
+                    break;
+                }
+                _ = reload_rx.recv() => {
+                    info!("Config change detected, reloading");
+                    if let Err(e) = self.reload_config().await {
+                        warn!(error = %e, "Failed to reload config");
+                    }
+                }
+            }
         }
 
+        // Cancel all tasks
+        self.stop_all_target_tasks().await;
+
         Ok(())
+    }
+
+    /// Start timer tasks for all targets
+    async fn start_all_target_tasks(&self) {
+        let mut targets = self.targets.write().await;
+        for (id, state) in targets.iter_mut() {
+            if state.task_handle.is_some() {
+                continue; // Already running
+            }
+            let handle = self.spawn_target_task(id.clone(), state.config.clone());
+            state.task_handle = Some(handle);
+        }
+    }
+
+    /// Stop all target tasks
+    async fn stop_all_target_tasks(&self) {
+        let mut targets = self.targets.write().await;
+        for state in targets.values_mut() {
+            if let Some(handle) = state.task_handle.take() {
+                handle.abort();
+            }
+        }
+    }
+
+    /// Spawn a timer task for a single target
+    fn spawn_target_task(&self, target_id: String, config: TargetConfig) -> JoinHandle<()> {
+        let interval = Duration::from_secs(config.interval_seconds);
+        let targets_ref = Arc::clone(&self.targets);
+        let path = config.path.clone();
+
+        tokio::spawn(async move {
+            let mut interval_timer = tokio::time::interval(interval);
+            interval_timer.tick().await; // Skip immediate first tick
+
+            loop {
+                interval_timer.tick().await;
+                Self::commit_target_static(&targets_ref, &target_id, &path).await;
+            }
+        })
+    }
+
+    /// Set up config file watcher
+    fn setup_config_watcher(&self, reload_tx: mpsc::Sender<()>) -> Option<RecommendedWatcher> {
+        let config_path = self.config_path.as_ref()?;
+
+        let path_for_handler = config_path.clone();
+        let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
+            if let Ok(event) = res {
+                // Only trigger on modify/create events for our config file
+                if (event.kind.is_modify() || event.kind.is_create())
+                    && event.paths.iter().any(|p| p == &path_for_handler)
+                {
+                    let _ = reload_tx.blocking_send(());
+                }
+            }
+        })
+        .ok()?;
+
+        // Watch the parent directory (more reliable for editors that do atomic saves)
+        if let Some(parent) = config_path.parent() {
+            if watcher.watch(parent, RecursiveMode::NonRecursive).is_err() {
+                warn!("Failed to watch config directory for changes");
+                return None;
+            }
+        }
+
+        info!(path = %config_path.display(), "Watching config file for changes");
+        Some(watcher)
+    }
+
+    /// Reload config and reconcile targets
+    async fn reload_config(&mut self) -> Result<(), SnapshotError> {
+        let config_path = match &self.config_path {
+            Some(p) => p.clone(),
+            None => return Ok(()), // No config path, nothing to reload
+        };
+
+        // Small delay to let editors finish writing
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Load new config
+        let new_config = match Config::load_from_sources(Some(&config_path)) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "Failed to parse config, keeping current");
+                return Ok(());
+            }
+        };
+
+        // Build set of new target paths
+        let new_target_paths: std::collections::HashSet<_> = new_config
+            .targets
+            .iter()
+            .filter(|t| t.enabled)
+            .map(|t| t.path.to_string_lossy().to_string())
+            .collect();
+
+        // Build set of current target paths
+        let current_paths: Vec<String> = {
+            let targets = self.targets.read().await;
+            targets.keys().cloned().collect()
+        };
+
+        // Remove targets that are no longer in config or disabled
+        for path in &current_paths {
+            if !new_target_paths.contains(path) {
+                self.remove_target(path).await;
+            }
+        }
+
+        // Add or update targets
+        for target in &new_config.targets {
+            if !target.enabled {
+                continue;
+            }
+
+            let path_key = target.path.to_string_lossy().to_string();
+            let needs_restart = {
+                let targets = self.targets.read().await;
+                if let Some(state) = targets.get(&path_key) {
+                    // Check if interval changed
+                    state.config.interval_seconds != target.interval_seconds
+                } else {
+                    false
+                }
+            };
+
+            if needs_restart {
+                // Interval changed, restart the task
+                self.remove_target(&path_key).await;
+            }
+
+            // Add if not present
+            let exists = {
+                let targets = self.targets.read().await;
+                targets.contains_key(&path_key)
+            };
+
+            if !exists {
+                self.add_target(target.clone()).await;
+            }
+        }
+
+        self.config = new_config;
+        info!("Config reloaded successfully");
+        Ok(())
+    }
+
+    /// Add a new target at runtime
+    async fn add_target(&self, target: TargetConfig) {
+        let path_key = target.path.to_string_lossy().to_string();
+
+        // Initialize the repo
+        let mut all_patterns = self.config.git.default_ignore_patterns.clone();
+        all_patterns.extend(target.ignore_patterns.clone());
+
+        if let Err(e) = ensure_repo_initialized(
+            &target.path,
+            &self.config.git.author_name,
+            &self.config.git.author_email,
+            &all_patterns,
+        )
+        .await
+        {
+            warn!(
+                target = %target.name(),
+                error = %e,
+                "Failed to initialize new target"
+            );
+            return;
+        }
+
+        // Spawn task and add to targets
+        let handle = self.spawn_target_task(path_key.clone(), target.clone());
+
+        let mut targets = self.targets.write().await;
+        targets.insert(
+            path_key.clone(),
+            TargetState {
+                config: target.clone(),
+                in_flight: false,
+                task_handle: Some(handle),
+            },
+        );
+
+        info!(target = %target.name(), "Added target");
+    }
+
+    /// Remove a target at runtime
+    async fn remove_target(&self, path_key: &str) {
+        let mut targets = self.targets.write().await;
+        if let Some(mut state) = targets.remove(path_key) {
+            if let Some(handle) = state.task_handle.take() {
+                handle.abort();
+            }
+            info!(target = %path_key, "Removed target");
+        }
     }
 
     async fn commit_all_targets(&self) {
@@ -293,7 +487,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut service = SnapshotService::new(config);
+        let mut service = SnapshotService::new(config, None);
         service.initialize().await.unwrap();
 
         // Check that our snapshot repo was initialized (not .git)
@@ -323,7 +517,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut service = SnapshotService::new(config);
+        let mut service = SnapshotService::new(config, None);
         service.initialize().await.unwrap();
 
         // Both repos should exist

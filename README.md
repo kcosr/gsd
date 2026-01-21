@@ -16,6 +16,9 @@ gsd uses a separate `.gsd/` directory, so it coexists peacefully with existing g
 - **Custom excludes**: Create a `.gsdignore` file for target-specific excludes
 - **Configurable intervals**: Set per-target commit intervals
 - **Gitignore support**: Configure ignore patterns globally and per-target
+- **Hot reload**: Config changes are detected automatically—no daemon restart needed
+- **CLI management**: Add, remove, enable, disable targets without editing config files
+- **Manual snapshots**: Take snapshots on demand without running the daemon
 - **Structured logging**: Uses tracing for structured, configurable logging
 
 ## Installation
