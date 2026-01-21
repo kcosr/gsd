@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use tokio::fs;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -48,7 +48,7 @@ pub async fn run_git(
     run_git_with_options(cwd, args, max_output_bytes, false).await
 }
 
-/// Run a git command using our snapshot git directory (.git-snapshotd)
+/// Run a git command using our snapshot git directory (.gsd)
 pub async fn run_snapshot_git(
     cwd: &Path,
     args: &[&str],
@@ -80,20 +80,17 @@ async fn run_git_with_options(
 
     let mut child = cmd.spawn()?;
 
-    let mut stdout_handle = child.stdout.take().expect("stdout piped");
-    let mut stderr_handle = child.stderr.take().expect("stderr piped");
+    let stdout_handle = child.stdout.take().expect("stdout piped");
+    let stderr_handle = child.stderr.take().expect("stderr piped");
 
-    let mut stdout_buf = vec![0u8; max_bytes];
-    let mut stderr_buf = Vec::new();
+    let stdout_read = read_with_cap(stdout_handle, max_bytes);
+    let stderr_read = read_with_cap(stderr_handle, max_bytes);
 
-    let stdout_read = stdout_handle.read(&mut stdout_buf);
-    let stderr_read = stderr_handle.read_to_end(&mut stderr_buf);
+    let (stdout_result, stderr_result) = tokio::join!(stdout_read, stderr_read);
+    let (stdout_buf, stdout_truncated) = stdout_result?;
+    let (stderr_buf, stderr_truncated) = stderr_result?;
 
-    let (stdout_len, _) = tokio::join!(stdout_read, stderr_read);
-    let stdout_len = stdout_len?;
-
-    let truncated = stdout_len >= max_bytes;
-    stdout_buf.truncate(stdout_len);
+    let truncated = stdout_truncated || stderr_truncated;
 
     let status = child.wait().await?;
 
@@ -103,6 +100,34 @@ async fn run_git_with_options(
         exit_code: status.code().unwrap_or(-1),
         truncated,
     })
+}
+
+async fn read_with_cap<R: AsyncRead + Unpin>(
+    mut reader: R,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool), std::io::Error> {
+    let mut buf = vec![0u8; 8192];
+    let mut out = Vec::new();
+    let mut truncated = false;
+
+    loop {
+        let read_len = reader.read(&mut buf).await?;
+        if read_len == 0 {
+            break;
+        }
+
+        if !truncated {
+            let remaining = max_bytes.saturating_sub(out.len());
+            if read_len <= remaining {
+                out.extend_from_slice(&buf[..read_len]);
+            } else {
+                out.extend_from_slice(&buf[..remaining]);
+                truncated = true;
+            }
+        }
+    }
+
+    Ok((out, truncated))
 }
 
 pub async fn is_git_available() -> bool {
@@ -118,10 +143,10 @@ pub async fn is_git_available() -> bool {
     }
 }
 
-/// Check if a directory has our snapshot git directory (.git-snapshotd).
+/// Check if a directory has our snapshot git directory (.gsd).
 ///
 /// We use a separate git directory from .git, so we never conflict with
-/// existing repositories. If .git-snapshotd exists, it's ours.
+/// existing repositories. If .gsd exists, it's ours.
 pub async fn check_repo_ownership(dir: &Path) -> Result<RepoOwnership, GitError> {
     let snapshot_git_path = dir.join(GSD_DIR);
 
@@ -273,6 +298,9 @@ pub async fn ensure_repo_initialized(
     author_email: &str,
     ignore_patterns: &[String],
 ) -> Result<(), GitError> {
+    let mut all_patterns = vec![format!("{}/", GSD_DIR)];
+    all_patterns.extend(ignore_patterns.iter().cloned());
+
     // Create directory if it doesn't exist
     fs::create_dir_all(dir).await?;
 
@@ -281,7 +309,7 @@ pub async fn ensure_repo_initialized(
     if ownership == RepoOwnership::Ours {
         // Already initialized by us, just ensure config and excludes
         ensure_local_git_config(dir, author_name, author_email).await?;
-        ensure_gitignore(dir, ignore_patterns).await?;
+        ensure_gitignore(dir, &all_patterns).await?;
         setup_gsd_excludes(dir).await?;
         return Ok(());
     }
@@ -298,8 +326,6 @@ pub async fn ensure_repo_initialized(
     ensure_local_git_config(dir, author_name, author_email).await?;
 
     // Set up gitignore - always include our own git directory
-    let mut all_patterns = vec![format!("{}/", GSD_DIR)];
-    all_patterns.extend(ignore_patterns.iter().cloned());
     ensure_gitignore(dir, &all_patterns).await?;
 
     // Set up .gsdignore -> .gsd/info/exclude

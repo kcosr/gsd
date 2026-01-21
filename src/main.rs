@@ -10,6 +10,8 @@ use clap::{Parser, Subcommand};
 use tracing::{error, info};
 
 use config::{Config, ConfigError, ConfigPathKind, TargetConfig, DEFAULT_INTERVAL_SECONDS};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::Match;
 use logging::LoggingSettings;
 use snapshot::SnapshotService;
 
@@ -244,6 +246,11 @@ fn add_target(
             prompt_with_default("Interval (seconds)", DEFAULT_INTERVAL_SECONDS)
         }
     };
+
+    if interval == 0 {
+        eprintln!("Error: interval_seconds must be > 0");
+        return Ok(ExitCode::from(1));
+    }
 
     // Confirm
     if !yes {
@@ -491,7 +498,7 @@ fn run_daemon(config_path: Option<&std::path::Path>) -> Result<ExitCode, CliErro
 
     // Initialize logging
     let logging_settings = LoggingSettings::from_config(&config.logging)?;
-    logging_settings.init_tracing()?;
+    let _logging_guards = logging_settings.init_tracing()?;
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -662,7 +669,6 @@ fn format_size(bytes: u64) -> String {
 }
 
 fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, CliError> {
-    use ignore::overrides::OverrideBuilder;
     use ignore::WalkBuilder;
     use std::collections::HashMap;
 
@@ -686,7 +692,7 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
         Err(ConfigError::Io { ref source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
-            println!("Note: No config file found, using default patterns only");
+            println!("Note: No config file found");
             println!();
             None
         }
@@ -697,75 +703,32 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
         }
     };
 
-    // Find matching target and collect patterns
-    let mut ignore_patterns: Vec<String> = vec![
-        // Always ignore .gsd and .git directories
-        ".gsd/".to_string(),
-        ".git/".to_string(),
-    ];
-
     let target_match = config
         .as_ref()
         .and_then(|cfg| cfg.targets.iter().find(|t| t.path == path));
 
-    if let Some(cfg) = &config {
-        // Add global default patterns
-        ignore_patterns.extend(cfg.git.default_ignore_patterns.clone());
-
-        if let Some(target) = target_match {
-            // Add target-specific patterns
-            ignore_patterns.extend(target.ignore_patterns.clone());
-        }
-    }
-
-    // Read .gitignore if present
-    let gitignore_path = path.join(".gitignore");
-    if gitignore_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&gitignore_path) {
-            for line in content.lines() {
-                let line = line.trim();
-                if !line.is_empty() && !line.starts_with('#') {
-                    ignore_patterns.push(line.to_string());
-                }
-            }
-        }
-    }
-
-    // Read .gsdignore if present (additional excludes)
-    let gsdignore_path = path.join(git::GSD_IGNORE_FILE);
-    if gsdignore_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&gsdignore_path) {
-            for line in content.lines() {
-                let line = line.trim();
-                if !line.is_empty() && !line.starts_with('#') {
-                    ignore_patterns.push(line.to_string());
-                }
-            }
-        }
-    }
-
-    // Build overrides for ignore patterns (negate them to exclude)
-    let mut override_builder = OverrideBuilder::new(&path);
-    for pattern in &ignore_patterns {
-        // Prefix with ! to negate (exclude) these patterns
-        let exclude_pattern = format!("!{}", pattern);
-        if let Err(e) = override_builder.add(&exclude_pattern) {
-            eprintln!("Warning: invalid pattern '{}': {}", pattern, e);
-        }
-    }
-    let overrides = override_builder
-        .build()
-        .unwrap_or_else(|_| OverrideBuilder::new(&path).build().unwrap());
+    let gsd_exclude = load_gsd_exclude(&path);
+    let gsd_exclude_filter = gsd_exclude.clone();
+    let root_path = path.clone();
 
     // Build the walker - sort to get consistent directory traversal order
     let mut builder = WalkBuilder::new(&path);
     builder
         .hidden(false) // Don't skip hidden files by default
-        .git_ignore(false) // Don't use .gitignore (we use .gsdignore)
-        .git_global(false)
-        .git_exclude(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
         .sort_by_file_path(|a, b| a.cmp(b))
-        .overrides(overrides);
+        .filter_entry(move |entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            if is_always_excluded(&root_path, entry.path()) {
+                return false;
+            }
+            !should_exclude_gsd(&gsd_exclude_filter, entry.path(), entry.file_type())
+        });
 
     // First pass: collect all files and their sizes
     let mut file_paths: Vec<PathBuf> = Vec::new();
@@ -780,7 +743,11 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
                     continue;
                 }
                 // Only collect files
-                if entry_path.is_file() {
+                let is_file = entry
+                    .file_type()
+                    .map(|ft| ft.is_file() || ft.is_symlink())
+                    .unwrap_or(false);
+                if is_file {
                     if let Ok(relative) = entry_path.strip_prefix(&path) {
                         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                         file_paths.push(relative.to_path_buf());
@@ -869,14 +836,22 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
         println!("  interval: {}s", target.interval_seconds);
         println!("  enabled: {}", target.enabled);
     } else {
-        println!("Target: NOT CONFIGURED (showing with default patterns only)");
+        println!("Target: NOT CONFIGURED");
     }
     println!();
 
-    println!("Ignore patterns:");
-    for pattern in &ignore_patterns {
-        println!("  {}", pattern);
+    println!("Ignore sources:");
+    println!("  .gitignore (all levels)");
+    println!("  .git/info/exclude (if present)");
+    if path
+        .join(git::GSD_DIR)
+        .join("info")
+        .join("exclude")
+        .exists()
+    {
+        println!("  .gsd/info/exclude");
     }
+    println!("  global git excludes (if configured)");
     println!();
 
     // Print table header
@@ -910,6 +885,64 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
     );
 
     Ok(ExitCode::SUCCESS)
+}
+
+fn load_gsd_exclude(root: &Path) -> Option<Gitignore> {
+    let exclude_path = root.join(git::GSD_DIR).join("info").join("exclude");
+    if !exclude_path.exists() {
+        return None;
+    }
+
+    let mut builder = GitignoreBuilder::new(root);
+    if let Some(err) = builder.add(&exclude_path) {
+        eprintln!(
+            "Warning: failed to parse {}: {}",
+            exclude_path.display(),
+            err
+        );
+    }
+
+    match builder.build() {
+        Ok(ignore) => Some(ignore),
+        Err(err) => {
+            eprintln!(
+                "Warning: failed to build excludes from {}: {}",
+                exclude_path.display(),
+                err
+            );
+            None
+        }
+    }
+}
+
+fn should_exclude_gsd(
+    gsd_exclude: &Option<Gitignore>,
+    path: &Path,
+    file_type: Option<std::fs::FileType>,
+) -> bool {
+    let Some(ignore) = gsd_exclude else {
+        return false;
+    };
+
+    let is_dir = file_type.map(|ft| ft.is_dir()).unwrap_or(false);
+    match ignore.matched(path, is_dir) {
+        Match::Ignore(_) => true,
+        Match::Whitelist(_) | Match::None => false,
+    }
+}
+
+fn is_always_excluded(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let Some(first) = relative.components().next() else {
+        return false;
+    };
+
+    match first {
+        std::path::Component::Normal(name) => name == ".gsd" || name == ".git",
+        _ => false,
+    }
 }
 
 fn load_config(path: Option<&std::path::Path>) -> Result<Config, CliError> {

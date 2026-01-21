@@ -377,10 +377,16 @@ impl SnapshotService {
     }
 
     async fn commit_all_targets(&self) {
-        let targets = self.targets.read().await;
+        let target_entries: Vec<(String, PathBuf)> = {
+            let targets = self.targets.read().await;
+            targets
+                .iter()
+                .map(|(id, state)| (id.clone(), state.config.path.clone()))
+                .collect()
+        };
 
-        for (id, state) in targets.iter() {
-            Self::commit_target_static(&self.targets, id, &state.config.path).await;
+        for (id, path) in target_entries {
+            Self::commit_target_static(&self.targets, &id, &path).await;
         }
     }
 

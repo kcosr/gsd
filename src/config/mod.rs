@@ -22,6 +22,14 @@ fn default_logging_level() -> String {
     "info".to_string()
 }
 
+fn default_logging_max_bytes() -> u64 {
+    104_857_600
+}
+
+fn default_logging_max_files() -> usize {
+    5
+}
+
 fn default_logging_console() -> bool {
     true
 }
@@ -69,6 +77,12 @@ pub struct LoggingConfig {
     #[serde(default)]
     pub directory: Option<PathBuf>,
 
+    #[serde(default = "default_logging_max_bytes")]
+    pub max_bytes: u64,
+
+    #[serde(default = "default_logging_max_files")]
+    pub max_files: usize,
+
     #[serde(default = "default_logging_console")]
     pub console: bool,
 }
@@ -78,6 +92,8 @@ impl Default for LoggingConfig {
         Self {
             level: default_logging_level(),
             directory: None,
+            max_bytes: default_logging_max_bytes(),
+            max_files: default_logging_max_files(),
             console: default_logging_console(),
         }
     }
@@ -342,6 +358,8 @@ schema_version = "1"
 [logging]
 level = "info"
 # directory = "/var/log/gsd"
+max_bytes = 104857600
+max_files = 5
 console = true
 
 [git]

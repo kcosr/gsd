@@ -102,6 +102,8 @@ schema_version = "1"
 [logging]
 level = "info"
 # directory = "/var/log/gsd"
+max_bytes = 104857600
+max_files = 5
 console = true
 
 [git]
@@ -129,6 +131,8 @@ enabled = true
 |--------|------|---------|-------------|
 | `level` | string | `"info"` | Log level (trace, debug, info, warn, error) |
 | `directory` | string | none | Directory for log files (optional) |
+| `max_bytes` | int | `104857600` | Max log file size before rotation |
+| `max_files` | int | `5` | Max rotated log files to keep |
 | `console` | bool | `true` | Output to console |
 
 #### Git
