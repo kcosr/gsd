@@ -279,14 +279,11 @@ fn remove_target(
     let gsd_dir = path.join(git::GSD_DIR);
     let has_gsd = gsd_dir.exists();
 
-    // Confirm
+    // Confirm removal from config
     if !yes {
         println!("Remove target: {}", path.display());
-        if has_gsd {
-            println!("  Will delete: {}", gsd_dir.display());
-        }
         println!("  config: {}", config_file.display());
-        if !confirm("Proceed?") {
+        if !confirm("Remove from config?") {
             println!("Cancelled.");
             return Ok(ExitCode::SUCCESS);
         }
@@ -295,14 +292,19 @@ fn remove_target(
     // Remove from config
     config.remove_target(&path)?;
     config.save(&config_file)?;
+    println!("Removed from config: {}", path.display());
 
-    // Delete .gsd directory
+    // Confirm deletion of .gsd directory
     if has_gsd {
-        std::fs::remove_dir_all(&gsd_dir)?;
-        println!("Deleted: {}", gsd_dir.display());
+        let delete_gsd = yes || confirm("Also delete .gsd directory (snapshot history)?");
+        if delete_gsd {
+            std::fs::remove_dir_all(&gsd_dir)?;
+            println!("Deleted: {}", gsd_dir.display());
+        } else {
+            println!("Kept: {}", gsd_dir.display());
+        }
     }
 
-    println!("Removed: {}", path.display());
     Ok(ExitCode::SUCCESS)
 }
 
