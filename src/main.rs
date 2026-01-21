@@ -294,7 +294,21 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
     }
 
     // Try to load config (optional)
-    let config = Config::load_from_sources(config_path).ok();
+    let config = match Config::load_from_sources(config_path) {
+        Ok(cfg) => Some(cfg),
+        Err(ConfigError::Io { ref source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            println!("Note: No config file found, using default patterns only");
+            println!();
+            None
+        }
+        Err(e) => {
+            eprintln!("Warning: Failed to load config: {}", e);
+            eprintln!();
+            None
+        }
+    };
 
     // Find matching target and collect patterns
     let mut ignore_patterns: Vec<String> = vec![
