@@ -158,19 +158,21 @@ gsd uses a **separate git directory** (`.gsd/`) instead of the standard `.git/`.
 
 The `.gsd/` directory is automatically added to `.gitignore` so it won't show up as untracked in your regular git workflow.
 
-## Custom Excludes with .gsdignore
+## Ignore Patterns
 
-Create a `.gsdignore` file in any target directory to exclude files from snapshots:
+gsd respects both `.gitignore` and `.gsdignore` files:
 
+- **`.gitignore`**: Standard git ignores are respected automatically
+- **`.gsdignore`**: Additional patterns specific to gsd snapshots
+
+Example `.gsdignore`:
 ```
-# .gsdignore - works like .gitignore
+# Additional excludes for gsd (on top of .gitignore)
 *.log
-tmp/
 .cache/
-node_modules/
 ```
 
-These patterns are copied to `.gsd/info/exclude`, keeping them separate from your project's `.gitignore`.
+Both files use gitignore syntax. Patterns from both are combined and copied to `.gsd/info/exclude`.
 
 ## Environment Variables
 

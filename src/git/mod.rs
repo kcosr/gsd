@@ -143,14 +143,29 @@ pub enum RepoOwnership {
 
 /// Reads .gsdignore if it exists and copies patterns to .gsd/info/exclude
 async fn setup_gsd_excludes(dir: &Path) -> Result<(), GitError> {
+    let gitignore_path = dir.join(".gitignore");
     let gsdignore_path = dir.join(GSD_IGNORE_FILE);
 
-    // Read .gsdignore if it exists
-    let patterns = match fs::read_to_string(&gsdignore_path).await {
+    // Read .gitignore if it exists
+    let gitignore_patterns = match fs::read_to_string(&gitignore_path).await {
         Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(GitError::Io(e)),
     };
+
+    // Read .gsdignore if it exists
+    let gsdignore_patterns = match fs::read_to_string(&gsdignore_path).await {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(GitError::Io(e)),
+    };
+
+    // Combine both
+    let patterns = format!("{}\n{}", gitignore_patterns, gsdignore_patterns);
+
+    if patterns.trim().is_empty() {
+        return Ok(());
+    }
 
     // Ensure .gsd/info directory exists
     let info_dir = dir.join(GSD_DIR).join("info");

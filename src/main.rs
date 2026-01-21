@@ -718,7 +718,20 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
         }
     }
 
-    // Read .gsdignore if present
+    // Read .gitignore if present
+    let gitignore_path = path.join(".gitignore");
+    if gitignore_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&gitignore_path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if !line.is_empty() && !line.starts_with('#') {
+                    ignore_patterns.push(line.to_string());
+                }
+            }
+        }
+    }
+
+    // Read .gsdignore if present (additional excludes)
     let gsdignore_path = path.join(git::GSD_IGNORE_FILE);
     if gsdignore_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&gsdignore_path) {
