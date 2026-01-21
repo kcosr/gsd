@@ -4,7 +4,9 @@ Automatic git snapshots of monitored directories.
 
 ## Overview
 
-gsd monitors configured directories and automatically creates git commits at regular intervals. It uses a separate `.gsd/` directory, so it coexists peacefully with existing git repositories.
+gsd monitors configured directories and automatically creates git commits at regular intervals. It's designed for snapshotting files that are modified regularly by agents—skill documents, plan files, notes, and other working documents that benefit from continuous versioning.
+
+gsd uses a separate `.gsd/` directory, so it coexists peacefully with existing git repositories.
 
 ## Features
 
@@ -71,14 +73,14 @@ author_email = "gsd@local"
 default_ignore_patterns = ["*.db-wal", "*.db-shm", "*.db-journal"]
 
 [[targets]]
-path = "/home/user/notes"
+path = "/home/user/.agent/skills"
 interval_seconds = 60
 ignore_patterns = ["*.tmp", ".DS_Store"]
 enabled = true
 
 [[targets]]
-path = "/home/user/documents"
-interval_seconds = 300  # 5 minutes
+path = "/home/user/.agent/plans"
+interval_seconds = 60
 enabled = true
 ```
 
