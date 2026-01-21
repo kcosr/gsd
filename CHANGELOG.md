@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.1] - 2026-01-21
 
 ### Added
 - Added rotating file logging with size and retention limits (`max_bytes`, `max_files`) ([#0](https://github.com/kcosr/gsd/pull/0))
