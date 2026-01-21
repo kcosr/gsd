@@ -276,32 +276,32 @@ fn remove_target(
         return Ok(ExitCode::from(1));
     }
 
-    let gsd_dir = path.join(git::GSD_DIR);
-    let has_gsd = gsd_dir.exists();
-
-    // Confirm removal from config
-    if !yes {
-        println!("Remove target: {}", path.display());
-        println!("  config: {}", config_file.display());
-        if !confirm("Remove from config?") {
-            println!("Cancelled.");
-            return Ok(ExitCode::SUCCESS);
-        }
-    }
-
-    // Remove from config
+    // Remove from config (no confirmation needed)
     config.remove_target(&path)?;
     config.save(&config_file)?;
     println!("Removed from config: {}", path.display());
 
-    // Confirm deletion of .gsd directory
-    if has_gsd {
-        let delete_gsd = yes || confirm("Also delete .gsd directory (snapshot history)?");
+    // Prompt to delete .gsd directory
+    let gsd_dir = path.join(git::GSD_DIR);
+    if gsd_dir.exists() {
+        let delete_gsd = yes || confirm("Delete .gsd directory (snapshot history)?");
         if delete_gsd {
             std::fs::remove_dir_all(&gsd_dir)?;
             println!("Deleted: {}", gsd_dir.display());
         } else {
             println!("Kept: {}", gsd_dir.display());
+        }
+    }
+
+    // Prompt to delete .gsdignore
+    let gsdignore = path.join(git::GSD_IGNORE_FILE);
+    if gsdignore.exists() {
+        let delete_ignore = yes || confirm("Delete .gsdignore?");
+        if delete_ignore {
+            std::fs::remove_file(&gsdignore)?;
+            println!("Deleted: {}", gsdignore.display());
+        } else {
+            println!("Kept: {}", gsdignore.display());
         }
     }
 
