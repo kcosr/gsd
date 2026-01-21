@@ -53,6 +53,9 @@ gsd config init /etc/gsd/config.toml
 
 # Check target directories before running
 gsd check
+
+# Preview files that would be included in a snapshot
+gsd preview /path/to/directory
 ```
 
 ## Configuration

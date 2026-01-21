@@ -3,7 +3,7 @@ mod git;
 mod logging;
 mod snapshot;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -44,6 +44,12 @@ enum Command {
 
     /// Check target directories
     Check,
+
+    /// Preview files that would be included in a snapshot
+    Preview {
+        /// Directory path to preview
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -93,6 +99,7 @@ fn run(cli: Cli) -> Result<ExitCode, CliError> {
             ConfigCommand::Init { path } => init_config(&path),
         },
         Command::Check => check_targets(cli.config.as_deref()),
+        Command::Preview { path } => preview_path(&path, cli.config.as_deref()),
     }
 }
 
@@ -239,6 +246,134 @@ fn check_targets(config_path: Option<&std::path::Path>) -> Result<ExitCode, CliE
         println!("All targets OK");
         Ok(ExitCode::SUCCESS)
     }
+}
+
+fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, CliError> {
+    use ignore::overrides::OverrideBuilder;
+    use ignore::WalkBuilder;
+
+    // Canonicalize the path
+    let path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: Cannot access path {}: {}", path.display(), e);
+            return Ok(ExitCode::from(1));
+        }
+    };
+
+    if !path.is_dir() {
+        eprintln!("Error: {} is not a directory", path.display());
+        return Ok(ExitCode::from(1));
+    }
+
+    // Try to load config (optional)
+    let config = Config::load_from_sources(config_path).ok();
+
+    // Find matching target and collect patterns
+    let mut ignore_patterns: Vec<String> = vec![
+        // Always ignore .gsd and .git directories
+        ".gsd/".to_string(),
+        ".git/".to_string(),
+    ];
+
+    let target_match = config
+        .as_ref()
+        .and_then(|cfg| cfg.targets.iter().find(|t| t.path == path));
+
+    if let Some(cfg) = &config {
+        // Add global default patterns
+        ignore_patterns.extend(cfg.git.default_ignore_patterns.clone());
+
+        if let Some(target) = target_match {
+            // Add target-specific patterns
+            ignore_patterns.extend(target.ignore_patterns.clone());
+        }
+    }
+
+    // Read .gsdignore if present
+    let gsdignore_path = path.join(git::GSD_IGNORE_FILE);
+    if gsdignore_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&gsdignore_path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if !line.is_empty() && !line.starts_with('#') {
+                    ignore_patterns.push(line.to_string());
+                }
+            }
+        }
+    }
+
+    // Build overrides for ignore patterns (negate them to exclude)
+    let mut override_builder = OverrideBuilder::new(&path);
+    for pattern in &ignore_patterns {
+        // Prefix with ! to negate (exclude) these patterns
+        let exclude_pattern = format!("!{}", pattern);
+        if let Err(e) = override_builder.add(&exclude_pattern) {
+            eprintln!("Warning: invalid pattern '{}': {}", pattern, e);
+        }
+    }
+    let overrides = override_builder
+        .build()
+        .unwrap_or_else(|_| OverrideBuilder::new(&path).build().unwrap());
+
+    // Build the walker
+    let mut builder = WalkBuilder::new(&path);
+    builder
+        .hidden(false) // Don't skip hidden files by default
+        .git_ignore(false) // Don't use .gitignore (we use .gsdignore)
+        .git_global(false)
+        .git_exclude(false)
+        .overrides(overrides);
+
+    // Collect files
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in builder.build() {
+        match entry {
+            Ok(entry) => {
+                let entry_path = entry.path();
+                // Skip the root directory itself
+                if entry_path == path {
+                    continue;
+                }
+                // Skip directories (we only want files)
+                if entry_path.is_file() {
+                    if let Ok(relative) = entry_path.strip_prefix(&path) {
+                        files.push(relative.to_path_buf());
+                    }
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    // Sort for consistent output
+    files.sort();
+
+    // Print results
+    println!("Preview: {}", path.display());
+    println!();
+
+    if let Some(target) = target_match {
+        println!("Target: CONFIGURED");
+        println!("  interval: {}s", target.interval_seconds);
+        println!("  enabled: {}", target.enabled);
+    } else {
+        println!("Target: NOT CONFIGURED (showing with default patterns only)");
+    }
+    println!();
+
+    println!("Ignore patterns:");
+    for pattern in &ignore_patterns {
+        println!("  {}", pattern);
+    }
+    println!();
+
+    println!("Files ({}):", files.len());
+    for file in &files {
+        println!("  {}", file.display());
+    }
+
+    Ok(ExitCode::SUCCESS)
 }
 
 fn load_config(path: Option<&std::path::Path>) -> Result<Config, CliError> {

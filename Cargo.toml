@@ -15,6 +15,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio = { version = "1", features = ["full"] }
 notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
 notify-debouncer-mini = "0.4"
+ignore = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
