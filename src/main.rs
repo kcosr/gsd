@@ -248,9 +248,36 @@ fn check_targets(config_path: Option<&std::path::Path>) -> Result<ExitCode, CliE
     }
 }
 
+/// Entry representing a file or directory in the preview
+#[derive(Debug)]
+struct PreviewEntry {
+    path: PathBuf,
+    is_dir: bool,
+    size: u64,
+    depth: usize,
+}
+
+/// Format bytes as human-readable size
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        format!("{:.1}GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1}MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1}KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
 fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, CliError> {
     use ignore::overrides::OverrideBuilder;
     use ignore::WalkBuilder;
+    use std::collections::HashMap;
 
     // Canonicalize the path
     let path = match path.canonicalize() {
@@ -316,17 +343,20 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
         .build()
         .unwrap_or_else(|_| OverrideBuilder::new(&path).build().unwrap());
 
-    // Build the walker
+    // Build the walker - sort to get consistent directory traversal order
     let mut builder = WalkBuilder::new(&path);
     builder
         .hidden(false) // Don't skip hidden files by default
         .git_ignore(false) // Don't use .gitignore (we use .gsdignore)
         .git_global(false)
         .git_exclude(false)
+        .sort_by_file_path(|a, b| a.cmp(b))
         .overrides(overrides);
 
-    // Collect files
-    let mut files: Vec<PathBuf> = Vec::new();
+    // First pass: collect all files and their sizes
+    let mut file_paths: Vec<PathBuf> = Vec::new();
+    let mut file_sizes: HashMap<PathBuf, u64> = HashMap::new();
+
     for entry in builder.build() {
         match entry {
             Ok(entry) => {
@@ -335,10 +365,12 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
                 if entry_path == path {
                     continue;
                 }
-                // Skip directories (we only want files)
+                // Only collect files
                 if entry_path.is_file() {
                     if let Ok(relative) = entry_path.strip_prefix(&path) {
-                        files.push(relative.to_path_buf());
+                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        file_paths.push(relative.to_path_buf());
+                        file_sizes.insert(relative.to_path_buf(), size);
                     }
                 }
             }
@@ -346,8 +378,73 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
         }
     }
 
-    // Sort for consistent output
-    files.sort();
+    // Build directory sizes by summing file sizes
+    let mut dir_sizes: HashMap<PathBuf, u64> = HashMap::new();
+    for (file_path, size) in &file_sizes {
+        // Add size to all parent directories
+        let mut current = file_path.parent();
+        while let Some(parent) = current {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            *dir_sizes.entry(parent.to_path_buf()).or_insert(0) += size;
+            current = parent.parent();
+        }
+    }
+
+    // Collect directories that contain files (non-empty)
+    let mut dirs_with_files: Vec<PathBuf> = dir_sizes.keys().cloned().collect();
+    dirs_with_files.sort();
+
+    // Build the display entries in traversal order
+    let mut entries: Vec<PreviewEntry> = Vec::new();
+    let mut shown_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    // Sort files for consistent output
+    file_paths.sort();
+
+    for file_path in &file_paths {
+        // First, ensure all parent directories are shown
+        let mut ancestors: Vec<PathBuf> = Vec::new();
+        let mut current = file_path.parent();
+        while let Some(parent) = current {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            ancestors.push(parent.to_path_buf());
+            current = parent.parent();
+        }
+        ancestors.reverse();
+
+        for ancestor in ancestors {
+            if !shown_dirs.contains(&ancestor) {
+                shown_dirs.insert(ancestor.clone());
+                let depth = ancestor.components().count();
+                let size = dir_sizes.get(&ancestor).copied().unwrap_or(0);
+                entries.push(PreviewEntry {
+                    path: ancestor,
+                    is_dir: true,
+                    size,
+                    depth,
+                });
+            }
+        }
+
+        // Add the file
+        let depth = file_path.components().count();
+        let size = file_sizes.get(file_path).copied().unwrap_or(0);
+        entries.push(PreviewEntry {
+            path: file_path.clone(),
+            is_dir: false,
+            size,
+            depth,
+        });
+    }
+
+    // Calculate totals
+    let total_files = file_paths.len();
+    let total_dirs = shown_dirs.len();
+    let total_size: u64 = file_sizes.values().sum();
 
     // Print results
     println!("Preview: {}", path.display());
@@ -368,10 +465,35 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
     }
     println!();
 
-    println!("Files ({}):", files.len());
-    for file in &files {
-        println!("  {}", file.display());
+    // Print table header
+    println!("{:<4}  {:>8}  PATH", "TYPE", "SIZE");
+
+    // Print entries
+    for entry in &entries {
+        let type_str = if entry.is_dir { "dir" } else { "file" };
+        let size_str = format_size(entry.size);
+        let indent = "  ".repeat(entry.depth.saturating_sub(1));
+        let name = entry
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| entry.path.to_string_lossy().to_string());
+        let display_name = if entry.is_dir {
+            format!("{}{}/", indent, name)
+        } else {
+            format!("{}{}", indent, name)
+        };
+        println!("{:<4}  {:>8}  {}", type_str, size_str, display_name);
     }
+
+    // Print summary
+    println!("{}", "─".repeat(40));
+    println!(
+        "Total: {} files, {} dirs, {}",
+        total_files,
+        total_dirs,
+        format_size(total_size)
+    );
 
     Ok(ExitCode::SUCCESS)
 }
