@@ -330,3 +330,68 @@ impl Write for RotatingFileWriter {
         self.file.flush()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_logging_settings_rejects_zero_max_bytes() {
+        let temp = TempDir::new().unwrap();
+        let cfg = LoggingConfig {
+            level: "info".to_string(),
+            directory: Some(temp.path().to_path_buf()),
+            max_bytes: 0,
+            max_files: 1,
+            console: true,
+        };
+
+        assert!(matches!(
+            LoggingSettings::from_config(&cfg),
+            Err(LoggingError::InvalidConfig {
+                field: "max_bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_logging_settings_rejects_zero_max_files() {
+        let temp = TempDir::new().unwrap();
+        let cfg = LoggingConfig {
+            level: "info".to_string(),
+            directory: Some(temp.path().to_path_buf()),
+            max_bytes: 10,
+            max_files: 0,
+            console: true,
+        };
+
+        assert!(matches!(
+            LoggingSettings::from_config(&cfg),
+            Err(LoggingError::InvalidConfig {
+                field: "max_files",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_rotating_file_writer_rotates_on_size() {
+        let temp = TempDir::new().unwrap();
+        let base_path = temp.path().join("gsd.log");
+
+        let mut writer = RotatingFileWriter::new(base_path.clone(), 5, 2).unwrap();
+        writer.write_all(b"hello").unwrap();
+        writer.write_all(b"!").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let current = fs::read_to_string(&base_path).unwrap();
+        assert_eq!(current, "!");
+
+        let rotated = fs::read_to_string(temp.path().join("gsd.log.1")).unwrap();
+        assert_eq!(rotated, "hello");
+        assert!(!temp.path().join("gsd.log.2").exists());
+    }
+}
