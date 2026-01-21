@@ -12,7 +12,7 @@ fn default_config_path() -> PathBuf {
     xdg_config_path().unwrap_or_else(|| PathBuf::from("/etc/gsd/config.toml"))
 }
 const DEFAULT_SCHEMA_VERSION: &str = "1";
-const DEFAULT_INTERVAL_SECONDS: u64 = 60;
+pub const DEFAULT_INTERVAL_SECONDS: u64 = 60;
 
 fn default_schema_version() -> String {
     DEFAULT_SCHEMA_VERSION.to_string()

@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use tracing::{error, info};
 
-use config::{Config, ConfigError, ConfigPathKind, TargetConfig};
+use config::{Config, ConfigError, ConfigPathKind, TargetConfig, DEFAULT_INTERVAL_SECONDS};
 use logging::LoggingSettings;
 use snapshot::SnapshotService;
 
@@ -42,8 +42,8 @@ enum Command {
         path: Option<PathBuf>,
 
         /// Snapshot interval in seconds
-        #[arg(short, long, default_value = "60")]
-        interval: u64,
+        #[arg(short, long)]
+        interval: Option<u64>,
 
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
@@ -202,9 +202,24 @@ fn confirm(prompt: &str) -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
+/// Prompt for a value with a default
+fn prompt_with_default(prompt: &str, default: u64) -> u64 {
+    use std::io::{self, Write};
+    print!("{} [{}]: ", prompt, default);
+    io::stdout().flush().unwrap();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    let input = input.trim();
+    if input.is_empty() {
+        default
+    } else {
+        input.parse().unwrap_or(default)
+    }
+}
+
 fn add_target(
     path: Option<PathBuf>,
-    interval: u64,
+    interval: Option<u64>,
     yes: bool,
     config_path: Option<&Path>,
 ) -> Result<ExitCode, CliError> {
@@ -219,11 +234,20 @@ fn add_target(
         return Ok(ExitCode::from(1));
     }
 
+    // Determine interval
+    let interval = match interval {
+        Some(i) => i,
+        None if yes => DEFAULT_INTERVAL_SECONDS,
+        None => {
+            println!("Add target: {}", path.display());
+            println!("  config: {}", config_file.display());
+            prompt_with_default("Interval (seconds)", DEFAULT_INTERVAL_SECONDS)
+        }
+    };
+
     // Confirm
     if !yes {
-        println!("Add target: {}", path.display());
         println!("  interval: {}s", interval);
-        println!("  config: {}", config_file.display());
         if !confirm("Proceed?") {
             println!("Cancelled.");
             return Ok(ExitCode::SUCCESS);
