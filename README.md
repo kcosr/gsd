@@ -68,6 +68,13 @@ gsd snapshot -m "My message"
 gsd preview
 gsd preview /path/to/dir
 
+# Access snapshot history via git
+gsd git log
+gsd git log --oneline -20
+gsd git show HEAD~3:file.txt      # view old version
+gsd git diff HEAD~1               # compare with previous
+gsd git restore --source HEAD~3 file.txt  # restore old version
+
 # Run the daemon
 gsd run
 

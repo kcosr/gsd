@@ -82,6 +82,18 @@ enum Command {
         message: Option<String>,
     },
 
+    /// Run git commands against the .gsd repository
+    #[command(trailing_var_arg = true)]
+    Git {
+        /// Directory path (defaults to current directory)
+        #[arg(short = 'C', long)]
+        path: Option<PathBuf>,
+
+        /// Git arguments
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Preview files that would be included in a snapshot
     Preview {
         /// Directory path to preview (defaults to current directory)
@@ -155,6 +167,7 @@ fn run(cli: Cli) -> Result<ExitCode, CliError> {
         Command::Enable { path } => set_target_enabled(path, true, cli.config.as_deref()),
         Command::Disable { path } => set_target_enabled(path, false, cli.config.as_deref()),
         Command::Snapshot { path, message } => take_snapshot(path, message),
+        Command::Git { path, args } => run_git_command(path, args),
         Command::Preview { path } => {
             let path = resolve_target_path(path)?;
             preview_path(&path, cli.config.as_deref())
@@ -385,6 +398,48 @@ fn take_snapshot(path: Option<PathBuf>, message: Option<String>) -> Result<ExitC
 
         Ok(ExitCode::SUCCESS)
     })
+}
+
+fn run_git_command(path: Option<PathBuf>, args: Vec<String>) -> Result<ExitCode, CliError> {
+    let path = resolve_target_path(path)?;
+
+    // Check if .gsd exists
+    let gsd_dir = path.join(git::GSD_DIR);
+    if !gsd_dir.exists() {
+        eprintln!(
+            "Error: No .gsd directory found in {}. Run 'gsd add' first.",
+            path.display()
+        );
+        return Ok(ExitCode::from(1));
+    }
+
+    // Reject flags we set ourselves
+    for arg in &args {
+        if arg == "--git-dir"
+            || arg == "--work-tree"
+            || arg == "-C"
+            || arg.starts_with("--git-dir=")
+            || arg.starts_with("--work-tree=")
+        {
+            eprintln!(
+                "Error: {} is set automatically by gsd and cannot be overridden.",
+                arg.split('=').next().unwrap_or(arg)
+            );
+            eprintln!("Use 'gsd git -C <path>' to specify the working directory.");
+            return Ok(ExitCode::from(1));
+        }
+    }
+
+    // Run git with --git-dir and --work-tree
+    let status = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&gsd_dir)
+        .arg("--work-tree")
+        .arg(&path)
+        .args(&args)
+        .status()?;
+
+    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
 fn show_config_path(config_path: Option<&Path>) -> Result<ExitCode, CliError> {
