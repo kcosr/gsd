@@ -46,15 +46,15 @@ gsd
 
 ```bash
 # Add current directory to monitoring (initializes .gsd, adds to config)
-gsd add
+gsd add                       # Prompts for interval
 gsd add /path/to/dir
-gsd add -y                    # Skip confirmation
 gsd add -i 300                # Set interval to 5 minutes
+gsd add -y                    # Skip prompts, use defaults
 
-# Remove directory from monitoring (deletes .gsd, removes from config)
-gsd remove
+# Remove directory from monitoring
+gsd remove                    # Prompts to delete .gsd and .gsdignore separately
 gsd remove /path/to/dir
-gsd remove -y                 # Skip confirmation
+gsd remove -y                 # Delete both without prompting
 
 # Enable/disable monitoring
 gsd enable
@@ -71,9 +71,10 @@ gsd preview /path/to/dir
 # Access snapshot history via git
 gsd git log
 gsd git log --oneline -20
-gsd git show HEAD~3:file.txt      # view old version
-gsd git diff HEAD~1               # compare with previous
-gsd git restore --source HEAD~3 file.txt  # restore old version
+gsd git show HEAD~3:file.txt      # View old version
+gsd git diff HEAD~1               # Compare with previous
+gsd git restore --source HEAD~3 file.txt  # Restore old version
+gsd git -C /path/to/dir log       # Specify directory
 
 # Run the daemon
 gsd run
