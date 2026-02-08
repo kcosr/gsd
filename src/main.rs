@@ -396,6 +396,8 @@ fn take_snapshot(path: Option<PathBuf>, message: Option<String>) -> Result<ExitC
         .map_err(|e| CliError::Io(std::io::Error::other(e)))?;
 
     runtime.block_on(async {
+        git::sync_snapshot_excludes(&path).await?;
+
         // Check for changes
         let has_changes = git::has_changes(&path).await?;
         if !has_changes {

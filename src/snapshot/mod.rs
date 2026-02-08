@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use crate::config::{Config, TargetConfig};
 use crate::git::{
     commit_all, ensure_repo_initialized, has_changes, is_detached_head, is_git_available,
-    list_changed_files, GitError,
+    list_changed_files, sync_snapshot_excludes, GitError,
 };
 
 #[derive(Debug)]
@@ -426,6 +426,8 @@ impl SnapshotService {
     }
 
     async fn do_commit(target_id: &str, path: &Path) -> Result<(), GitError> {
+        sync_snapshot_excludes(path).await?;
+
         // Check for detached HEAD
         if is_detached_head(path).await? {
             warn!(

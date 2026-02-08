@@ -176,7 +176,8 @@ Example `.gsdignore`:
 .cache/
 ```
 
-Both files use gitignore syntax. Patterns from both are combined and copied to `.gsd/info/exclude`.
+Both files use gitignore syntax. Patterns from both are synced to `.gsd/info/exclude` before snapshot commits.
+Treat `.gsd/info/exclude` as internal generated state and edit `.gsdignore` instead.
 
 To use allowlist-style rules, use gitignore negation patterns (`!`) and re-include parent directories:
 
