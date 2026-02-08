@@ -396,6 +396,8 @@ fn take_snapshot(path: Option<PathBuf>, message: Option<String>) -> Result<ExitC
         .map_err(|e| CliError::Io(std::io::Error::other(e)))?;
 
     runtime.block_on(async {
+        git::sync_snapshot_excludes(&path).await?;
+
         // Check for changes
         let has_changes = git::has_changes(&path).await?;
         if !has_changes {
@@ -707,8 +709,8 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
         .as_ref()
         .and_then(|cfg| cfg.targets.iter().find(|t| t.path == path));
 
-    let gsd_exclude = load_gsd_exclude(&path);
-    let gsd_exclude_filter = gsd_exclude.clone();
+    let preview_ignore = load_preview_ignore(&path);
+    let preview_ignore_filter = preview_ignore.matcher.clone();
     let root_path = path.clone();
 
     // Build the walker - sort to get consistent directory traversal order
@@ -727,7 +729,7 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
             if is_always_excluded(&root_path, entry.path()) {
                 return false;
             }
-            !should_exclude_gsd(&gsd_exclude_filter, entry.path(), entry.file_type())
+            true
         });
 
     // First pass: collect all files and their sizes
@@ -748,6 +750,9 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
                     .map(|ft| ft.is_file() || ft.is_symlink())
                     .unwrap_or(false);
                 if is_file {
+                    if should_exclude_gsd(&preview_ignore_filter, entry_path, entry.file_type()) {
+                        continue;
+                    }
                     if let Ok(relative) = entry_path.strip_prefix(&path) {
                         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                         file_paths.push(relative.to_path_buf());
@@ -851,6 +856,9 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
     {
         println!("  .gsd/info/exclude");
     }
+    if preview_ignore.uses_gsdignore {
+        println!("  .gsdignore");
+    }
     println!("  global git excludes (if configured)");
     println!();
 
@@ -887,31 +895,57 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
     Ok(ExitCode::SUCCESS)
 }
 
-fn load_gsd_exclude(root: &Path) -> Option<Gitignore> {
+#[derive(Clone)]
+struct PreviewIgnore {
+    matcher: Option<Gitignore>,
+    uses_gsdignore: bool,
+}
+
+fn load_preview_ignore(root: &Path) -> PreviewIgnore {
     let exclude_path = root.join(git::GSD_DIR).join("info").join("exclude");
-    if !exclude_path.exists() {
-        return None;
+    let gsdignore_path = root.join(git::GSD_IGNORE_FILE);
+
+    let mut paths = Vec::new();
+    if exclude_path.exists() {
+        paths.push(exclude_path.clone());
+    }
+    if gsdignore_path.exists() {
+        paths.push(gsdignore_path.clone());
+    }
+
+    if paths.is_empty() {
+        return PreviewIgnore {
+            matcher: None,
+            uses_gsdignore: false,
+        };
     }
 
     let mut builder = GitignoreBuilder::new(root);
-    if let Some(err) = builder.add(&exclude_path) {
-        eprintln!(
-            "Warning: failed to parse {}: {}",
-            exclude_path.display(),
-            err
-        );
+    for ignore_path in &paths {
+        if let Some(err) = builder.add(ignore_path) {
+            eprintln!(
+                "Warning: failed to parse {}: {}",
+                ignore_path.display(),
+                err
+            );
+        }
     }
 
-    match builder.build() {
+    let matcher = match builder.build() {
         Ok(ignore) => Some(ignore),
         Err(err) => {
             eprintln!(
-                "Warning: failed to build excludes from {}: {}",
-                exclude_path.display(),
+                "Warning: failed to build preview excludes for {}: {}",
+                root.display(),
                 err
             );
             None
         }
+    };
+
+    PreviewIgnore {
+        matcher,
+        uses_gsdignore: gsdignore_path.exists(),
     }
 }
 
@@ -973,5 +1007,69 @@ fn load_config_with_path(path: Option<&std::path::Path>) -> Result<(Config, Path
             )))
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn file_type(path: &Path) -> Option<std::fs::FileType> {
+        std::fs::symlink_metadata(path).ok().map(|m| m.file_type())
+    }
+
+    #[test]
+    fn test_preview_ignore_reincludes_allowlisted_path() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("test")).unwrap();
+        std::fs::write(root.join("test").join("a.txt"), "ok").unwrap();
+        std::fs::write(root.join("other.txt"), "no").unwrap();
+        std::fs::write(root.join(".gsdignore"), "*\n!test/\n!test/**\n").unwrap();
+
+        let preview_ignore = load_preview_ignore(root);
+        assert!(preview_ignore.uses_gsdignore);
+
+        let included = root.join("test").join("a.txt");
+        let excluded = root.join("other.txt");
+        assert!(!should_exclude_gsd(
+            &preview_ignore.matcher,
+            &included,
+            file_type(&included),
+        ));
+        assert!(should_exclude_gsd(
+            &preview_ignore.matcher,
+            &excluded,
+            file_type(&excluded),
+        ));
+    }
+
+    #[test]
+    fn test_preview_ignore_reincludes_hidden_allowlisted_path() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let hidden_file = root.join(".codex").join("skills").join("note.md");
+        std::fs::create_dir_all(hidden_file.parent().unwrap()).unwrap();
+        std::fs::write(&hidden_file, "ok").unwrap();
+        let excluded = root.join("other.txt");
+        std::fs::write(&excluded, "no").unwrap();
+        std::fs::write(
+            root.join(".gsdignore"),
+            "*\n!.codex/\n!.codex/skills/\n!.codex/skills/**\n",
+        )
+        .unwrap();
+
+        let preview_ignore = load_preview_ignore(root);
+        assert!(!should_exclude_gsd(
+            &preview_ignore.matcher,
+            &hidden_file,
+            file_type(&hidden_file),
+        ));
+        assert!(should_exclude_gsd(
+            &preview_ignore.matcher,
+            &excluded,
+            file_type(&excluded),
+        ));
     }
 }

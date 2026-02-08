@@ -37,3 +37,61 @@ fn test_preview_respects_gitignore_and_gsd_exclude() {
     assert!(stdout.contains("secrets.txt"), "stdout:\n{stdout}");
     assert!(!stdout.contains("ignored.log"), "stdout:\n{stdout}");
 }
+
+#[test]
+fn test_preview_respects_gsdignore_allowlist_patterns() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+
+    fs::create_dir_all(root.join("test")).unwrap();
+    fs::write(root.join("test").join("a.txt"), "ok").unwrap();
+    fs::write(root.join("other.txt"), "no").unwrap();
+    fs::write(root.join(".gsdignore"), "*\n!test/\n!test/**\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_gsd"))
+        .arg("preview")
+        .arg(root)
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join(".config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("a.txt"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("other.txt"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn test_preview_respects_gsdignore_allowlist_for_hidden_tree() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+
+    fs::create_dir_all(root.join(".codex").join("skills")).unwrap();
+    fs::write(root.join(".codex").join("skills").join("note.md"), "ok").unwrap();
+    fs::write(root.join("other.txt"), "no").unwrap();
+    fs::write(
+        root.join(".gsdignore"),
+        "*\n!.codex/\n!.codex/skills/\n!.codex/skills/**\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_gsd"))
+        .arg("preview")
+        .arg(root)
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join(".config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("note.md"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("other.txt"), "stdout:\n{stdout}");
+}
