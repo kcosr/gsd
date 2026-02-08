@@ -167,7 +167,7 @@ The `.gsd/` directory is automatically added to `.gitignore` so it won't show up
 gsd respects both `.gitignore` and `.gsdignore` files:
 
 - **`.gitignore`**: Standard git ignores are respected automatically
-- **`.gsdignore`**: Additional patterns specific to gsd snapshots
+- **`.gsdignore`**: Additional patterns specific to gsd snapshots (used by `gsd preview` even before `.gsd/` exists)
 
 Example `.gsdignore`:
 ```
@@ -177,6 +177,17 @@ Example `.gsdignore`:
 ```
 
 Both files use gitignore syntax. Patterns from both are combined and copied to `.gsd/info/exclude`.
+
+To use allowlist-style rules, use gitignore negation patterns (`!`) and re-include parent directories:
+
+```gitignore
+*
+!.codex/
+!.codex/skills/
+!.codex/skills/**
+```
+
+`gsd preview` can be used before `gsd add`; in that case output will show `Target: NOT CONFIGURED`.
 
 ## Environment Variables
 

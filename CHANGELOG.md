@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Fixed
+
+- Fixed `gsd preview` to honor `.gsdignore` allowlist negation patterns (`!`) reliably, including hidden paths and runs before `.gsd/` exists.
 
 ## [0.0.1] - 2026-01-21
 
