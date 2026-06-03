@@ -12,6 +12,7 @@
 ### Fixed
 
 - Hardened release version validation, local and remote tag checks, release recovery instructions, and release-script cleanup paths. ([#2](https://github.com/kcosr/gsd/pull/2))
+- Improved release-script diagnostics and changelog validation edge cases. ([#2](https://github.com/kcosr/gsd/pull/2))
 - Fixed the `Cargo.lock` package version for `gsd` to match `Cargo.toml`. ([#2](https://github.com/kcosr/gsd/pull/2))
 - Fixed `gsd preview` to honor `.gsdignore` allowlist negation patterns (`!`) reliably, including hidden paths and runs before `.gsd/` exists ([#1](https://github.com/kcosr/gsd/pull/1)).
 - Synced `.gsdignore`/`.gitignore` to `.gsd/info/exclude` before snapshot commits and made exclude syncing authoritative so removed patterns are applied immediately ([#1](https://github.com/kcosr/gsd/pull/1)).
