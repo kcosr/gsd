@@ -21,11 +21,24 @@ gsd uses a separate `.gsd/` directory, so it coexists peacefully with existing g
 - **Manual snapshots**: Take snapshots on demand without running the daemon
 - **Structured logging**: Uses tracing for structured, configurable logging
 
-## Installation
+## Install
+
+Download the latest archive for your platform from
+[GitHub Releases](https://github.com/kcosr/gsd/releases), extract it, and
+install the binary:
 
 ```bash
-cargo install --path .
+VERSION=0.0.1
+PLATFORM=linux-x86_64
+RELEASE_ROOT="/path/to/gsd-${VERSION}-${PLATFORM}"
+
+sudo install -m 0755 "$RELEASE_ROOT/bin/gsd" /usr/local/bin/gsd
 ```
+
+Supported release platforms are currently:
+
+- `linux-x86_64`
+- `macos-arm64`
 
 ## Usage
 
@@ -196,6 +209,86 @@ To use allowlist-style rules, use gitignore negation patterns (`!`) and re-inclu
 |----------|-------------|
 | `GSD_CONFIG` | Path to configuration file |
 | `GSD_LOG_LEVEL` | Override log level from config |
+
+## Development
+
+Use source builds for local development or unsupported release platforms.
+
+```bash
+cargo build --release
+```
+
+The release binary is written to:
+
+```text
+target/release/gsd
+```
+
+For substantial code changes, run:
+
+```bash
+cargo fmt
+cargo clippy
+cargo test
+cargo build --release
+```
+
+## Release
+
+Releases are driven from `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
+Use `current` when `Cargo.toml` already has the intended release version, use
+`patch`, `minor`, or `major`, or pass an explicit stable version:
+
+```bash
+node scripts/release.mjs current
+node scripts/release.mjs patch
+node scripts/release.mjs minor
+node scripts/release.mjs major
+node scripts/release.mjs 0.1.0
+```
+
+The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a
+matching git tag, creates a GitHub release with notes from the changelog, then
+commits a fresh `Unreleased` section for the next cycle.
+
+If GitHub release creation fails after the commit and tag are pushed, recover
+by creating the release manually for the existing tag instead of rerunning the
+script. Then add a fresh `## [Unreleased]` section with the standard
+`_No unreleased changes._` placeholder, commit it as
+`Prepare for next release`, and push `main`.
+
+Release binaries are packaged separately after the target-platform binary has
+been built by the release operator. Build Linux x86_64 on Linux, and build
+macOS ARM64 natively on Apple Silicon. Supported release archives currently use
+these names:
+
+```text
+gsd-VERSION-linux-x86_64.tar.gz
+gsd-VERSION-macos-arm64.tar.gz
+```
+
+Each archive should contain one top-level directory named
+`gsd-VERSION-PLATFORM` with:
+
+- `bin/gsd` - snapshot daemon and CLI.
+- `README.md`
+- `LICENSE`
+- `CHANGELOG.md`
+
+Example packaging flow:
+
+```bash
+VERSION=$(sed -n '/^\[package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+PLATFORM=linux-x86_64 # or macos-arm64
+OUT=/tmp/gsd-release-${VERSION}
+ROOT="gsd-${VERSION}-${PLATFORM}"
+
+rm -rf "$OUT/$ROOT" "$OUT/${ROOT}.tar.gz"
+mkdir -p "$OUT/$ROOT/bin"
+install -m 755 target/release/gsd "$OUT/$ROOT/bin/gsd"
+cp README.md LICENSE CHANGELOG.md "$OUT/$ROOT/"
+tar -C "$OUT" -czf "$OUT/${ROOT}.tar.gz" "$ROOT"
+```
 
 ## License
 

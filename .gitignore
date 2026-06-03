@@ -4,5 +4,8 @@
 # Build service
 .build-service/workspace-id
 
+# Release script
+/.release-notes-tmp.md
+
 # Codemap
 .codemap/
