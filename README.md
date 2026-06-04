@@ -6,12 +6,13 @@ Automatic git snapshots of monitored directories.
 
 gsd monitors configured directories and automatically creates git commits at regular intervals. It's designed for snapshotting files that are modified regularly by agents—skill documents, plan files, notes, and other working documents that benefit from continuous versioning.
 
-gsd uses a separate `.gsd/` directory, so it coexists peacefully with existing git repositories.
+gsd uses a separate snapshot git directory, so it coexists peacefully with existing git repositories. By default that directory is `.gsd/` inside each monitored target. You can also configure a central archive root so snapshot repositories live outside the monitored directories.
 
 ## Features
 
 - **Multiple targets**: Monitor multiple directories with individual settings
-- **Separate git directory**: Uses `.gsd/` instead of `.git/`, so it coexists with existing repos
+- **Separate git directory**: Uses `.gsd/` or a configured central archive instead of `.git/`, so it coexists with existing repos
+- **Central archives**: Optionally store all snapshot repositories under a configured archive root
 - **No conflicts**: Your project's `.git` folder is completely untouched
 - **Custom excludes**: Create a `.gsdignore` file for target-specific excludes
 - **Configurable intervals**: Set per-target commit intervals
@@ -58,14 +59,14 @@ gsd
 ### Commands
 
 ```bash
-# Add current directory to monitoring (initializes .gsd, adds to config)
+# Add current directory to monitoring (initializes snapshot archive, adds to config)
 gsd add                       # Prompts for interval
 gsd add /path/to/dir
 gsd add -i 300                # Set interval to 5 minutes
 gsd add -y                    # Skip prompts, use defaults
 
 # Remove directory from monitoring
-gsd remove                    # Prompts to delete .gsd and .gsdignore separately
+gsd remove                    # Prompts to delete snapshot history and .gsdignore separately
 gsd remove /path/to/dir
 gsd remove -y                 # Delete both without prompting
 
@@ -122,6 +123,7 @@ console = true
 [git]
 author_name = "gsd"
 author_email = "gsd@local"
+# archive_root = "/var/lib/gsd/archives"
 default_ignore_patterns = ["*.db-wal", "*.db-shm", "*.db-journal"]
 
 [[targets]]
@@ -154,6 +156,7 @@ enabled = true
 |--------|------|---------|-------------|
 | `author_name` | string | `"gsd"` | Git commit author name |
 | `author_email` | string | `"gsd@local"` | Git commit author email |
+| `archive_root` | string | none | Optional absolute directory for central snapshot archives |
 | `default_ignore_patterns` | array | `["*.db-wal", ...]` | Default gitignore patterns |
 
 #### Targets
@@ -167,13 +170,30 @@ enabled = true
 
 ## How It Works
 
-gsd uses a **separate git directory** (`.gsd/`) instead of the standard `.git/`. This means:
+gsd uses a **separate git directory** instead of the standard `.git/`. In default colocated mode, this is `target/.gsd/`. If `[git].archive_root` is configured, each target gets a separate git archive under that root.
 
 - **Coexistence**: Your existing git repositories are completely unaffected
 - **No conflicts**: You can snapshot a directory that's already a git repo
 - **Clean separation**: Snapshot history is independent from your project history
 
-The `.gsd/` directory is automatically added to `.gitignore` so it won't show up as untracked in your regular git workflow.
+In colocated mode, `.gsd/` is automatically added to `.gitignore` so it won't show up as untracked in your regular git workflow. In central archive mode, no `.gsd/` directory is created inside the target.
+
+### Central Archive Root
+
+Set `[git].archive_root` to store snapshot repositories in one central directory:
+
+```toml
+[git]
+archive_root = "/var/lib/gsd/archives"
+```
+
+Archive names are derived from the target's canonical absolute path using a readable full-path encoding plus a stable hash suffix, for example:
+
+```text
+/etc/systemd/system -> --etc-systemd-system--.822eaa5daa51.git
+```
+
+The hash suffix is intentional because readable path sanitization is not reversible by itself. Newly created central archive roots are given private permissions on Unix; existing archive roots are not silently chmodded.
 
 ## Ignore Patterns
 
@@ -189,8 +209,8 @@ Example `.gsdignore`:
 .cache/
 ```
 
-Both files use gitignore syntax. Patterns from both are synced to `.gsd/info/exclude` before snapshot commits.
-Treat `.gsd/info/exclude` as internal generated state and edit `.gsdignore` instead.
+Both files use gitignore syntax. Patterns from both are synced to the snapshot repository's `info/exclude` before snapshot commits.
+Treat that `info/exclude` file as internal generated state and edit `.gsdignore` instead.
 
 To use allowlist-style rules, use gitignore negation patterns (`!`) and re-include parent directories:
 

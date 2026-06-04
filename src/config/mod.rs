@@ -107,6 +107,10 @@ pub struct GitConfig {
     #[serde(default = "default_author_email")]
     pub author_email: String,
 
+    /// Optional root directory for central snapshot archives
+    #[serde(default)]
+    pub archive_root: Option<PathBuf>,
+
     #[serde(default = "default_ignore_patterns")]
     pub default_ignore_patterns: Vec<String>,
 }
@@ -116,6 +120,7 @@ impl Default for GitConfig {
         Self {
             author_name: default_author_name(),
             author_email: default_author_email(),
+            archive_root: None,
             default_ignore_patterns: default_ignore_patterns(),
         }
     }
@@ -323,6 +328,15 @@ impl Config {
             ));
         }
 
+        if let Some(archive_root) = &self.git.archive_root {
+            if !archive_root.is_absolute() {
+                return Err(ConfigError::Invalid(format!(
+                    "git archive_root must be absolute: {}",
+                    archive_root.display()
+                )));
+            }
+        }
+
         let mut seen_paths = std::collections::HashSet::new();
         for target in &self.targets {
             if !target.path.is_absolute() {
@@ -365,6 +379,7 @@ console = true
 [git]
 author_name = "gsd"
 author_email = "gsd@local"
+# archive_root = "/var/lib/gsd/archives"
 default_ignore_patterns = ["*.db-wal", "*.db-shm", "*.db-journal"]
 
 # Example target configuration
@@ -409,6 +424,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_git_archive_root() {
+        let toml = r#"
+            [git]
+            archive_root = "/var/lib/gsd/archives"
+
+            [[targets]]
+            path = "/tmp/test"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.git.archive_root,
+            Some(PathBuf::from("/var/lib/gsd/archives"))
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn test_validate_duplicate_paths() {
         let config = Config {
             targets: vec![
@@ -439,6 +471,18 @@ mod tests {
                 ignore_patterns: vec![],
                 enabled: true,
             }],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_relative_archive_root() {
+        let config = Config {
+            git: GitConfig {
+                archive_root: Some(PathBuf::from("relative/archives")),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(config.validate().is_err());

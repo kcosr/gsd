@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,12 +11,14 @@ use tracing::{debug, info, warn};
 use crate::config::{Config, TargetConfig};
 use crate::git::{
     commit_all, ensure_repo_initialized, has_changes, is_detached_head, is_git_available,
-    list_changed_files, sync_snapshot_excludes, GitError,
+    list_changed_files, sync_snapshot_excludes, GitError, SnapshotRepo,
 };
 
 #[derive(Debug)]
 struct TargetState {
     config: TargetConfig,
+    repo: SnapshotRepo,
+    ignore_patterns: Vec<String>,
     in_flight: bool,
     task_handle: Option<JoinHandle<()>>,
 }
@@ -92,16 +94,18 @@ impl SnapshotService {
 
             match ensure_repo_initialized(
                 &target.path,
+                self.config.git.archive_root.as_deref(),
                 &self.config.git.author_name,
                 &self.config.git.author_email,
                 &all_patterns,
             )
             .await
             {
-                Ok(()) => {
+                Ok(repo) => {
                     info!(
                         target = %target.name(),
                         path = %target.path.display(),
+                        git_dir = %repo.git_dir.display(),
                         interval_seconds = target.interval_seconds,
                         "Initialized target"
                     );
@@ -111,6 +115,8 @@ impl SnapshotService {
                         target.path.to_string_lossy().to_string(),
                         TargetState {
                             config: target.clone(),
+                            repo,
+                            ignore_patterns: all_patterns,
                             in_flight: false,
                             task_handle: None,
                         },
@@ -186,7 +192,12 @@ impl SnapshotService {
             if state.task_handle.is_some() {
                 continue; // Already running
             }
-            let handle = self.spawn_target_task(id.clone(), state.config.clone());
+            let handle = self.spawn_target_task(
+                id.clone(),
+                state.config.clone(),
+                state.repo.clone(),
+                state.ignore_patterns.clone(),
+            );
             state.task_handle = Some(handle);
         }
     }
@@ -202,10 +213,15 @@ impl SnapshotService {
     }
 
     /// Spawn a timer task for a single target
-    fn spawn_target_task(&self, target_id: String, config: TargetConfig) -> JoinHandle<()> {
+    fn spawn_target_task(
+        &self,
+        target_id: String,
+        config: TargetConfig,
+        repo: SnapshotRepo,
+        ignore_patterns: Vec<String>,
+    ) -> JoinHandle<()> {
         let interval = Duration::from_secs(config.interval_seconds);
         let targets_ref = Arc::clone(&self.targets);
-        let path = config.path.clone();
 
         tokio::spawn(async move {
             let mut interval_timer = tokio::time::interval(interval);
@@ -213,7 +229,7 @@ impl SnapshotService {
 
             loop {
                 interval_timer.tick().await;
-                Self::commit_target_static(&targets_ref, &target_id, &path).await;
+                Self::commit_target_static(&targets_ref, &target_id, &repo, &ignore_patterns).await;
             }
         })
     }
@@ -266,6 +282,18 @@ impl SnapshotService {
             }
         };
 
+        let storage_changed = self.config.git.archive_root != new_config.git.archive_root;
+
+        if storage_changed {
+            let current_paths: Vec<String> = {
+                let targets = self.targets.read().await;
+                targets.keys().cloned().collect()
+            };
+            for path in &current_paths {
+                self.remove_target(path).await;
+            }
+        }
+
         // Build set of new target paths
         let new_target_paths: std::collections::HashSet<_> = new_config
             .targets
@@ -294,11 +322,14 @@ impl SnapshotService {
             }
 
             let path_key = target.path.to_string_lossy().to_string();
+            let mut all_patterns = new_config.git.default_ignore_patterns.clone();
+            all_patterns.extend(target.ignore_patterns.clone());
             let needs_restart = {
                 let targets = self.targets.read().await;
                 if let Some(state) = targets.get(&path_key) {
-                    // Check if interval changed
                     state.config.interval_seconds != target.interval_seconds
+                        || state.config.ignore_patterns != target.ignore_patterns
+                        || state.ignore_patterns != all_patterns
                 } else {
                     false
                 }
@@ -333,30 +364,41 @@ impl SnapshotService {
         let mut all_patterns = self.config.git.default_ignore_patterns.clone();
         all_patterns.extend(target.ignore_patterns.clone());
 
-        if let Err(e) = ensure_repo_initialized(
+        let repo = match ensure_repo_initialized(
             &target.path,
+            self.config.git.archive_root.as_deref(),
             &self.config.git.author_name,
             &self.config.git.author_email,
             &all_patterns,
         )
         .await
         {
-            warn!(
-                target = %target.name(),
-                error = %e,
-                "Failed to initialize new target"
-            );
-            return;
-        }
+            Ok(repo) => repo,
+            Err(e) => {
+                warn!(
+                    target = %target.name(),
+                    error = %e,
+                    "Failed to initialize new target"
+                );
+                return;
+            }
+        };
 
         // Spawn task and add to targets
-        let handle = self.spawn_target_task(path_key.clone(), target.clone());
+        let handle = self.spawn_target_task(
+            path_key.clone(),
+            target.clone(),
+            repo.clone(),
+            all_patterns.clone(),
+        );
 
         let mut targets = self.targets.write().await;
         targets.insert(
             path_key.clone(),
             TargetState {
                 config: target.clone(),
+                repo,
+                ignore_patterns: all_patterns,
                 in_flight: false,
                 task_handle: Some(handle),
             },
@@ -377,23 +419,30 @@ impl SnapshotService {
     }
 
     async fn commit_all_targets(&self) {
-        let target_entries: Vec<(String, PathBuf)> = {
+        let target_entries: Vec<(String, SnapshotRepo, Vec<String>)> = {
             let targets = self.targets.read().await;
             targets
                 .iter()
-                .map(|(id, state)| (id.clone(), state.config.path.clone()))
+                .map(|(id, state)| {
+                    (
+                        id.clone(),
+                        state.repo.clone(),
+                        state.ignore_patterns.clone(),
+                    )
+                })
                 .collect()
         };
 
-        for (id, path) in target_entries {
-            Self::commit_target_static(&self.targets, &id, &path).await;
+        for (id, repo, ignore_patterns) in target_entries {
+            Self::commit_target_static(&self.targets, &id, &repo, &ignore_patterns).await;
         }
     }
 
     async fn commit_target_static(
         targets: &Arc<RwLock<HashMap<String, TargetState>>>,
         target_id: &str,
-        path: &Path,
+        repo: &SnapshotRepo,
+        ignore_patterns: &[String],
     ) {
         // Check and set in_flight
         {
@@ -410,7 +459,7 @@ impl SnapshotService {
         }
 
         // Do the actual commit work
-        let result = Self::do_commit(target_id, path).await;
+        let result = Self::do_commit(target_id, repo, ignore_patterns).await;
 
         // Clear in_flight
         {
@@ -425,28 +474,32 @@ impl SnapshotService {
         }
     }
 
-    async fn do_commit(target_id: &str, path: &Path) -> Result<(), GitError> {
-        sync_snapshot_excludes(path).await?;
+    async fn do_commit(
+        target_id: &str,
+        repo: &SnapshotRepo,
+        ignore_patterns: &[String],
+    ) -> Result<(), GitError> {
+        sync_snapshot_excludes(repo, ignore_patterns).await?;
 
         // Check for detached HEAD
-        if is_detached_head(path).await? {
+        if is_detached_head(repo).await? {
             warn!(
                 target = %target_id,
                 "Detached HEAD detected, skipping commit"
             );
             return Err(GitError::DetachedHead {
-                path: path.to_path_buf(),
+                path: repo.work_tree.clone(),
             });
         }
 
         // Check for changes
-        if !has_changes(path).await? {
+        if !has_changes(repo).await? {
             debug!(target = %target_id, "No changes to commit");
             return Ok(());
         }
 
         // Get changed files for commit message
-        let changed_files = list_changed_files(path).await?;
+        let changed_files = list_changed_files(repo).await?;
         let message = format_commit_message(&changed_files, 10);
 
         info!(
@@ -456,7 +509,7 @@ impl SnapshotService {
             "Committing changes"
         );
 
-        commit_all(path, &message).await?;
+        commit_all(repo, &message).await?;
 
         Ok(())
     }
