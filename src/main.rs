@@ -21,8 +21,8 @@ use snapshot::SnapshotService;
     version,
     about = "Git snapshot daemon - automatic versioning of directories",
     long_about = "gsd monitors configured directories and automatically creates git commits \
-                  at regular intervals. Uses a separate .gsd/ directory so it coexists with \
-                  existing git repositories."
+                  at regular intervals. Uses a separate snapshot git directory so it coexists \
+                  with existing git repositories."
 )]
 struct Cli {
     /// Path to configuration file
@@ -38,7 +38,7 @@ enum Command {
     /// Run the daemon (default)
     Run,
 
-    /// Add a directory to monitoring (initializes .gsd and adds to config)
+    /// Add a directory to monitoring (initializes snapshot archive and adds to config)
     Add {
         /// Directory path to add (defaults to current directory)
         path: Option<PathBuf>,
@@ -52,7 +52,7 @@ enum Command {
         yes: bool,
     },
 
-    /// Remove a directory from monitoring (removes from config and deletes .gsd)
+    /// Remove a directory from monitoring (removes from config and optionally deletes archive)
     Remove {
         /// Directory path to remove (defaults to current directory)
         path: Option<PathBuf>,
@@ -84,7 +84,7 @@ enum Command {
         message: Option<String>,
     },
 
-    /// Run git commands against the .gsd repository
+    /// Run git commands against the snapshot repository
     #[command(trailing_var_arg = true)]
     Git {
         /// Directory path (defaults to current directory)
@@ -168,8 +168,8 @@ fn run(cli: Cli) -> Result<ExitCode, CliError> {
         Command::Remove { path, yes } => remove_target(path, yes, cli.config.as_deref()),
         Command::Enable { path } => set_target_enabled(path, true, cli.config.as_deref()),
         Command::Disable { path } => set_target_enabled(path, false, cli.config.as_deref()),
-        Command::Snapshot { path, message } => take_snapshot(path, message),
-        Command::Git { path, args } => run_git_command(path, args),
+        Command::Snapshot { path, message } => take_snapshot(path, message, cli.config.as_deref()),
+        Command::Git { path, args } => run_git_command(path, args, cli.config.as_deref()),
         Command::Preview { path } => {
             let path = resolve_target_path(path)?;
             preview_path(&path, cli.config.as_deref())
@@ -229,6 +229,7 @@ fn add_target(
 
     // Load or create config
     let (mut config, config_file) = Config::load_or_create(config_path)?;
+    config.validate()?;
 
     // Check if already exists
     if config.find_target(&path).is_some() {
@@ -261,7 +262,7 @@ fn add_target(
         }
     }
 
-    // Initialize .gsd repo
+    // Initialize snapshot archive
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -270,6 +271,7 @@ fn add_target(
     runtime.block_on(async {
         git::ensure_repo_initialized(
             &path,
+            config.git.archive_root.as_deref(),
             &config.git.author_name,
             &config.git.author_email,
             &config.git.default_ignore_patterns,
@@ -307,20 +309,26 @@ fn remove_target(
         return Ok(ExitCode::from(1));
     }
 
+    let repo = git::resolve_snapshot_repo(&path, config.git.archive_root.as_deref())?;
+
     // Remove from config (no confirmation needed)
     config.remove_target(&path)?;
     config.save(&config_file)?;
     println!("Removed from config: {}", path.display());
 
-    // Prompt to delete .gsd directory
-    let gsd_dir = path.join(git::GSD_DIR);
-    if gsd_dir.exists() {
-        let delete_gsd = yes || confirm("Delete .gsd directory (snapshot history)?");
-        if delete_gsd {
-            std::fs::remove_dir_all(&gsd_dir)?;
-            println!("Deleted: {}", gsd_dir.display());
+    // Prompt to delete snapshot archive
+    if repo.git_dir.exists() {
+        let prompt = if repo.is_colocated() {
+            "Delete .gsd directory (snapshot history)?"
         } else {
-            println!("Kept: {}", gsd_dir.display());
+            "Delete central snapshot archive (snapshot history)?"
+        };
+        let delete_gsd = yes || confirm(prompt);
+        if delete_gsd {
+            std::fs::remove_dir_all(&repo.git_dir)?;
+            println!("Deleted: {}", repo.git_dir.display());
+        } else {
+            println!("Kept: {}", repo.git_dir.display());
         }
     }
 
@@ -377,15 +385,22 @@ fn set_target_enabled(
     Ok(ExitCode::SUCCESS)
 }
 
-fn take_snapshot(path: Option<PathBuf>, message: Option<String>) -> Result<ExitCode, CliError> {
+fn take_snapshot(
+    path: Option<PathBuf>,
+    message: Option<String>,
+    config_path: Option<&Path>,
+) -> Result<ExitCode, CliError> {
     let path = resolve_target_path(path)?;
+    let config = load_config_optional(config_path)?.unwrap_or_default();
+    let repo = git::resolve_snapshot_repo(&path, config.git.archive_root.as_deref())?;
+    let ignore_patterns = configured_ignore_patterns(&config, &path);
 
-    // Check if .gsd exists
-    let gsd_dir = path.join(git::GSD_DIR);
-    if !gsd_dir.exists() {
+    // Check if snapshot archive exists
+    if !repo.git_dir.exists() {
         eprintln!(
-            "Error: No .gsd directory found in {}. Run 'gsd add' first.",
-            path.display()
+            "Error: No snapshot archive found for {} at {}. Run 'gsd add' first.",
+            path.display(),
+            repo.git_dir.display()
         );
         return Ok(ExitCode::from(1));
     }
@@ -396,17 +411,17 @@ fn take_snapshot(path: Option<PathBuf>, message: Option<String>) -> Result<ExitC
         .map_err(|e| CliError::Io(std::io::Error::other(e)))?;
 
     runtime.block_on(async {
-        git::sync_snapshot_excludes(&path).await?;
+        git::sync_snapshot_excludes(&repo, &ignore_patterns).await?;
 
         // Check for changes
-        let has_changes = git::has_changes(&path).await?;
+        let has_changes = git::has_changes(&repo).await?;
         if !has_changes {
             println!("No changes to snapshot.");
             return Ok(ExitCode::SUCCESS);
         }
 
         // Get changed files for auto-message
-        let changed_files = git::list_changed_files(&path).await?;
+        let changed_files = git::list_changed_files(&repo).await?;
 
         // Generate or use provided message
         let commit_message = message.unwrap_or_else(|| {
@@ -424,7 +439,7 @@ fn take_snapshot(path: Option<PathBuf>, message: Option<String>) -> Result<ExitC
         });
 
         // Commit
-        git::commit_all(&path, &commit_message).await?;
+        git::commit_all(&repo, &commit_message).await?;
 
         println!("Snapshot created: {} file(s)", changed_files.len());
         for f in &changed_files {
@@ -435,15 +450,21 @@ fn take_snapshot(path: Option<PathBuf>, message: Option<String>) -> Result<ExitC
     })
 }
 
-fn run_git_command(path: Option<PathBuf>, args: Vec<String>) -> Result<ExitCode, CliError> {
+fn run_git_command(
+    path: Option<PathBuf>,
+    args: Vec<String>,
+    config_path: Option<&Path>,
+) -> Result<ExitCode, CliError> {
     let path = resolve_target_path(path)?;
+    let config = load_config_optional(config_path)?.unwrap_or_default();
+    let repo = git::resolve_snapshot_repo(&path, config.git.archive_root.as_deref())?;
 
-    // Check if .gsd exists
-    let gsd_dir = path.join(git::GSD_DIR);
-    if !gsd_dir.exists() {
+    // Check if snapshot archive exists
+    if !repo.git_dir.exists() {
         eprintln!(
-            "Error: No .gsd directory found in {}. Run 'gsd add' first.",
-            path.display()
+            "Error: No snapshot archive found for {} at {}. Run 'gsd add' first.",
+            path.display(),
+            repo.git_dir.display()
         );
         return Ok(ExitCode::from(1));
     }
@@ -468,9 +489,9 @@ fn run_git_command(path: Option<PathBuf>, args: Vec<String>) -> Result<ExitCode,
     // Run git with --git-dir and --work-tree
     let status = std::process::Command::new("git")
         .arg("--git-dir")
-        .arg(&gsd_dir)
+        .arg(&repo.git_dir)
         .arg("--work-tree")
-        .arg(&path)
+        .arg(&repo.work_tree)
         .args(&args)
         .status()?;
 
@@ -597,15 +618,34 @@ fn check_targets(config_path: Option<&std::path::Path>) -> Result<ExitCode, CliE
 
     runtime.block_on(async {
         for target in &config.targets {
-            let snapshot_dir = target.path.join(git::GSD_DIR);
-            let has_snapshot_repo = snapshot_dir.exists();
+            let repo = match git::resolve_snapshot_repo(
+                &target.path,
+                config.git.archive_root.as_deref(),
+            ) {
+                Ok(repo) => repo,
+                Err(e) => {
+                    has_issues = true;
+                    error!(path = %target.path.display(), error = %e, "Check failed");
+                    println!(
+                        "{}: {} - ✗ Check failed",
+                        if target.enabled {
+                            "enabled "
+                        } else {
+                            "disabled"
+                        },
+                        target.path.display()
+                    );
+                    continue;
+                }
+            };
+            let has_snapshot_repo = repo.git_dir.exists();
             let has_regular_git = target.path.join(".git").exists();
 
-            let status = match git::check_repo_ownership(&target.path).await {
+            let status = match git::check_repo_ownership(&repo).await {
                 Ok(git::RepoOwnership::Ours) => "✓ Managed by gsd",
                 Ok(git::RepoOwnership::NoRepo) => {
                     if target.path.exists() {
-                        "✓ No .gsd repo (will initialize)"
+                        "✓ No snapshot archive (will initialize)"
                     } else {
                         "✓ Directory missing (will create)"
                     }
@@ -627,8 +667,9 @@ fn check_targets(config_path: Option<&std::path::Path>) -> Result<ExitCode, CliE
                 target.path.display(),
                 status
             );
+            println!("  Archive: {}", repo.git_dir.display());
             if has_regular_git && !has_snapshot_repo {
-                println!("  Note: Has .git (will coexist with .gsd)");
+                println!("  Note: Has .git (will coexist with snapshot archive)");
             }
         }
     });
@@ -709,9 +750,16 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
         .as_ref()
         .and_then(|cfg| cfg.targets.iter().find(|t| t.path == path));
 
-    let preview_ignore = load_preview_ignore(&path);
+    let preview_repo = config
+        .as_ref()
+        .and_then(|cfg| git::resolve_snapshot_repo(&path, cfg.git.archive_root.as_deref()).ok())
+        .unwrap_or_else(|| {
+            git::resolve_snapshot_repo(&path, None).expect("preview path was already canonicalized")
+        });
+    let preview_ignore = load_preview_ignore(&path, &preview_repo);
     let preview_ignore_filter = preview_ignore.matcher.clone();
     let root_path = path.clone();
+    let exclude_colocated_gsd = preview_repo.is_colocated();
 
     // Build the walker - sort to get consistent directory traversal order
     let mut builder = WalkBuilder::new(&path);
@@ -726,7 +774,7 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
             if entry.depth() == 0 {
                 return true;
             }
-            if is_always_excluded(&root_path, entry.path()) {
+            if is_always_excluded(&root_path, entry.path(), exclude_colocated_gsd) {
                 return false;
             }
             true
@@ -848,13 +896,15 @@ fn preview_path(path: &Path, config_path: Option<&Path>) -> Result<ExitCode, Cli
     println!("Ignore sources:");
     println!("  .gitignore (all levels)");
     println!("  .git/info/exclude (if present)");
-    if path
-        .join(git::GSD_DIR)
-        .join("info")
-        .join("exclude")
-        .exists()
-    {
-        println!("  .gsd/info/exclude");
+    if preview_repo.git_dir.join("info").join("exclude").exists() {
+        if preview_repo.is_colocated() {
+            println!("  .gsd/info/exclude");
+        } else {
+            println!(
+                "  snapshot info/exclude ({})",
+                preview_repo.git_dir.display()
+            );
+        }
     }
     if preview_ignore.uses_gsdignore {
         println!("  .gsdignore");
@@ -901,8 +951,8 @@ struct PreviewIgnore {
     uses_gsdignore: bool,
 }
 
-fn load_preview_ignore(root: &Path) -> PreviewIgnore {
-    let exclude_path = root.join(git::GSD_DIR).join("info").join("exclude");
+fn load_preview_ignore(root: &Path, repo: &git::SnapshotRepo) -> PreviewIgnore {
+    let exclude_path = repo.git_dir.join("info").join("exclude");
     let gsdignore_path = root.join(git::GSD_IGNORE_FILE);
 
     let mut paths = Vec::new();
@@ -965,7 +1015,7 @@ fn should_exclude_gsd(
     }
 }
 
-fn is_always_excluded(root: &Path, path: &Path) -> bool {
+fn is_always_excluded(root: &Path, path: &Path, exclude_colocated_gsd: bool) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
@@ -974,13 +1024,44 @@ fn is_always_excluded(root: &Path, path: &Path) -> bool {
     };
 
     match first {
-        std::path::Component::Normal(name) => name == ".gsd" || name == ".git",
+        std::path::Component::Normal(name) => {
+            name == ".git" || (exclude_colocated_gsd && name == ".gsd")
+        }
         _ => false,
     }
 }
 
 fn load_config(path: Option<&std::path::Path>) -> Result<Config, CliError> {
     load_config_with_path(path).map(|(cfg, _)| cfg)
+}
+
+fn load_config_optional(path: Option<&std::path::Path>) -> Result<Option<Config>, CliError> {
+    let (resolved_path, kind) = Config::resolve_path(path);
+
+    match Config::load_from_sources(path) {
+        Ok(cfg) => Ok(Some(cfg)),
+        Err(ConfigError::Io { ref source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound
+                && matches!(kind, ConfigPathKind::Default) =>
+        {
+            Ok(None)
+        }
+        Err(ConfigError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Err(CliError::Config(ConfigError::Invalid(format!(
+                "configuration file not found: {}",
+                resolved_path.display()
+            ))))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn configured_ignore_patterns(config: &Config, path: &Path) -> Vec<String> {
+    let mut patterns = config.git.default_ignore_patterns.clone();
+    if let Some(target) = config.find_target(path) {
+        patterns.extend(target.ignore_patterns.clone());
+    }
+    patterns
 }
 
 fn load_config_with_path(path: Option<&std::path::Path>) -> Result<(Config, PathBuf), CliError> {
@@ -1028,7 +1109,8 @@ mod tests {
         std::fs::write(root.join("other.txt"), "no").unwrap();
         std::fs::write(root.join(".gsdignore"), "*\n!test/\n!test/**\n").unwrap();
 
-        let preview_ignore = load_preview_ignore(root);
+        let repo = git::resolve_snapshot_repo(root, None).unwrap();
+        let preview_ignore = load_preview_ignore(root, &repo);
         assert!(preview_ignore.uses_gsdignore);
 
         let included = root.join("test").join("a.txt");
@@ -1060,7 +1142,8 @@ mod tests {
         )
         .unwrap();
 
-        let preview_ignore = load_preview_ignore(root);
+        let repo = git::resolve_snapshot_repo(root, None).unwrap();
+        let preview_ignore = load_preview_ignore(root, &repo);
         assert!(!should_exclude_gsd(
             &preview_ignore.matcher,
             &hidden_file,

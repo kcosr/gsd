@@ -2,7 +2,13 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Added optional central snapshot archive storage with `[git].archive_root`, including config-aware CLI, daemon, preview, and git operations. ([#3](https://github.com/kcosr/gsd/pull/3))
+
+### Changed
+
+- Snapshot repositories now reserve `.gsd/` in generated excludes so existing colocated archives are not captured when central archive storage is enabled. ([#3](https://github.com/kcosr/gsd/pull/3))
 
 ## [0.0.2] - 2026-06-03
 
