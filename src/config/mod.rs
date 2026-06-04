@@ -359,6 +359,16 @@ impl Config {
                     target.name()
                 )));
             }
+
+            if let Some(archive_root) = &self.git.archive_root {
+                if path_is_or_contains(target.path.as_path(), archive_root.as_path()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "git archive_root must not be inside target {}: {}",
+                        target.path.display(),
+                        archive_root.display()
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -394,6 +404,10 @@ default_ignore_patterns = ["*.db-wal", "*.db-shm", "*.db-journal"]
 "#
         .to_string()
     }
+}
+
+fn path_is_or_contains(parent: &Path, child: &Path) -> bool {
+    child == parent || child.starts_with(parent)
 }
 
 impl Default for Config {
@@ -483,6 +497,24 @@ mod tests {
                 archive_root: Some(PathBuf::from("relative/archives")),
                 ..Default::default()
             },
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_archive_root_inside_target() {
+        let config = Config {
+            git: GitConfig {
+                archive_root: Some(PathBuf::from("/tmp/project/.gsd-archives")),
+                ..Default::default()
+            },
+            targets: vec![TargetConfig {
+                path: PathBuf::from("/tmp/project"),
+                interval_seconds: 60,
+                ignore_patterns: vec![],
+                enabled: true,
+            }],
             ..Default::default()
         };
         assert!(config.validate().is_err());

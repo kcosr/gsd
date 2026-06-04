@@ -283,6 +283,7 @@ impl SnapshotService {
         };
 
         let storage_changed = self.config.git.archive_root != new_config.git.archive_root;
+        self.config = new_config;
 
         if storage_changed {
             let current_paths: Vec<String> = {
@@ -295,8 +296,8 @@ impl SnapshotService {
         }
 
         // Build set of new target paths
-        let new_target_paths: std::collections::HashSet<_> = new_config
-            .targets
+        let configured_targets = self.config.targets.clone();
+        let new_target_paths: std::collections::HashSet<_> = configured_targets
             .iter()
             .filter(|t| t.enabled)
             .map(|t| t.path.to_string_lossy().to_string())
@@ -316,13 +317,13 @@ impl SnapshotService {
         }
 
         // Add or update targets
-        for target in &new_config.targets {
+        for target in &configured_targets {
             if !target.enabled {
                 continue;
             }
 
             let path_key = target.path.to_string_lossy().to_string();
-            let mut all_patterns = new_config.git.default_ignore_patterns.clone();
+            let mut all_patterns = self.config.git.default_ignore_patterns.clone();
             all_patterns.extend(target.ignore_patterns.clone());
             let needs_restart = {
                 let targets = self.targets.read().await;
@@ -351,7 +352,6 @@ impl SnapshotService {
             }
         }
 
-        self.config = new_config;
         info!("Config reloaded successfully");
         Ok(())
     }
@@ -518,9 +518,26 @@ impl SnapshotService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::GSD_DIR;
+    use crate::config::GitConfig;
+    use crate::git::{resolve_snapshot_repo, run_snapshot_git, GSD_DIR};
     use tempfile::TempDir;
     use tokio::fs;
+
+    fn config_toml(target_path: &std::path::Path, archive_root: &std::path::Path) -> String {
+        format!(
+            r#"
+[git]
+archive_root = "{}"
+
+[[targets]]
+path = "{}"
+interval_seconds = 60
+enabled = true
+"#,
+            archive_root.display(),
+            target_path.display()
+        )
+    }
 
     #[test]
     fn test_format_commit_message() {
@@ -557,6 +574,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reload_config_moves_targets_to_new_archive_root() {
+        let temp = TempDir::new().unwrap();
+        let target_path = temp.path().join("target1");
+        let config_path = temp.path().join("config.toml");
+        let old_archive_root = temp.path().join("archives-old");
+        let new_archive_root = temp.path().join("archives-new");
+        fs::create_dir_all(&target_path).await.unwrap();
+        fs::write(&config_path, config_toml(&target_path, &old_archive_root))
+            .await
+            .unwrap();
+
+        let config = Config::load_from_sources(Some(&config_path)).unwrap();
+        let mut service = SnapshotService::new(config, Some(config_path.clone()));
+        service.initialize().await.unwrap();
+
+        let old_repo = resolve_snapshot_repo(&target_path, Some(&old_archive_root)).unwrap();
+        let new_repo = resolve_snapshot_repo(&target_path, Some(&new_archive_root)).unwrap();
+        assert!(old_repo.git_dir.exists());
+        assert!(!new_repo.git_dir.exists());
+
+        fs::write(&config_path, config_toml(&target_path, &new_archive_root))
+            .await
+            .unwrap();
+        service.reload_config().await.unwrap();
+
+        {
+            let targets = service.targets.read().await;
+            let state = targets
+                .get(&target_path.to_string_lossy().to_string())
+                .unwrap();
+            assert_eq!(state.repo.git_dir, new_repo.git_dir);
+        }
+        assert!(new_repo.git_dir.exists());
+
+        fs::write(target_path.join("changed.txt"), "changed")
+            .await
+            .unwrap();
+        service.commit_all_targets().await;
+
+        let latest_subject = run_snapshot_git(&new_repo, &["log", "--format=%s", "-1"], None)
+            .await
+            .unwrap();
+        assert_eq!(latest_subject.stdout.trim(), "changed.txt");
+
+        service.stop_all_target_tasks().await;
+    }
+
+    #[tokio::test]
     async fn test_service_coexists_with_regular_git() {
         let temp = TempDir::new().unwrap();
         let target_path = temp.path().join("project");
@@ -588,5 +653,34 @@ mod tests {
         // Target should be tracked
         let targets = service.targets.read().await;
         assert_eq!(targets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_service_initializes_central_archive_root() {
+        let temp = TempDir::new().unwrap();
+        let target_path = temp.path().join("target1");
+        let archive_root = temp.path().join("archives");
+        fs::create_dir_all(&target_path).await.unwrap();
+
+        let config = Config {
+            git: GitConfig {
+                archive_root: Some(archive_root.clone()),
+                ..Default::default()
+            },
+            targets: vec![crate::config::TargetConfig {
+                path: target_path.clone(),
+                interval_seconds: 60,
+                ignore_patterns: vec![],
+                enabled: true,
+            }],
+            ..Default::default()
+        };
+
+        let mut service = SnapshotService::new(config, None);
+        service.initialize().await.unwrap();
+
+        let repo = resolve_snapshot_repo(&target_path, Some(&archive_root)).unwrap();
+        assert!(repo.git_dir.exists());
+        assert!(!target_path.join(GSD_DIR).exists());
     }
 }

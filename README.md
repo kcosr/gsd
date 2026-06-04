@@ -176,7 +176,7 @@ gsd uses a **separate git directory** instead of the standard `.git/`. In defaul
 - **No conflicts**: You can snapshot a directory that's already a git repo
 - **Clean separation**: Snapshot history is independent from your project history
 
-In colocated mode, `.gsd/` is automatically added to `.gitignore` so it won't show up as untracked in your regular git workflow. In central archive mode, no `.gsd/` directory is created inside the target.
+In colocated mode, `.gsd/` is automatically added to `.gitignore` so it won't show up as untracked in your regular git workflow. In central archive mode, no `.gsd/` directory is created inside the target, and any existing target-local `.gsd/` directory is excluded from central snapshots.
 
 ### Central Archive Root
 
@@ -209,7 +209,7 @@ Example `.gsdignore`:
 .cache/
 ```
 
-Both files use gitignore syntax. Patterns from both are synced to the snapshot repository's `info/exclude` before snapshot commits.
+Both files use gitignore syntax. Patterns from both are synced to the snapshot repository's `info/exclude` before snapshot commits. gsd also reserves `.gsd/` as internal storage and excludes it from snapshots.
 Treat that `info/exclude` file as internal generated state and edit `.gsdignore` instead.
 
 To use allowlist-style rules, use gitignore negation patterns (`!`) and re-include parent directories:

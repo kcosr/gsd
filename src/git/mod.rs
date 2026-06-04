@@ -148,37 +148,9 @@ async fn run_git_with_options(
     args: &[&str],
     max_output_bytes: Option<usize>,
 ) -> Result<GitCommandResult, GitError> {
-    let max_bytes = max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES);
-
     let mut cmd = Command::new("git");
-
-    cmd.args(args);
-    cmd.current_dir(cwd);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-
-    let stdout_handle = child.stdout.take().expect("stdout piped");
-    let stderr_handle = child.stderr.take().expect("stderr piped");
-
-    let stdout_read = read_with_cap(stdout_handle, max_bytes);
-    let stderr_read = read_with_cap(stderr_handle, max_bytes);
-
-    let (stdout_result, stderr_result) = tokio::join!(stdout_read, stderr_read);
-    let (stdout_buf, stdout_truncated) = stdout_result?;
-    let (stderr_buf, stderr_truncated) = stderr_result?;
-
-    let truncated = stdout_truncated || stderr_truncated;
-
-    let status = child.wait().await?;
-
-    Ok(GitCommandResult {
-        stdout: String::from_utf8_lossy(&stdout_buf).to_string(),
-        stderr: String::from_utf8_lossy(&stderr_buf).to_string(),
-        exit_code: status.code().unwrap_or(-1),
-        truncated,
-    })
+    cmd.args(args).current_dir(cwd);
+    run_prepared_git_command(cmd, max_output_bytes).await
 }
 
 async fn run_snapshot_git_with_options(
@@ -186,17 +158,24 @@ async fn run_snapshot_git_with_options(
     args: &[&str],
     max_output_bytes: Option<usize>,
 ) -> Result<GitCommandResult, GitError> {
-    let max_bytes = max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES);
-
     let mut cmd = Command::new("git");
     cmd.arg("--git-dir")
         .arg(&repo.git_dir)
         .arg("--work-tree")
         .arg(&repo.work_tree)
         .args(args)
-        .current_dir(&repo.work_tree)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .current_dir(&repo.work_tree);
+    run_prepared_git_command(cmd, max_output_bytes).await
+}
+
+async fn run_prepared_git_command(
+    mut cmd: Command,
+    max_output_bytes: Option<usize>,
+) -> Result<GitCommandResult, GitError> {
+    let max_bytes = max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES);
+
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn()?;
 
@@ -310,9 +289,15 @@ pub async fn sync_snapshot_excludes(
         Err(e) => return Err(GitError::Io(e)),
     };
 
-    // Keep gitignore semantics and ordering: .gitignore first, then .gsdignore.
-    let patterns: Vec<String> = gitignore_patterns
-        .lines()
+    // Always reserve .gsd/ for target-local snapshot archives, even when
+    // central storage is configured and the target .gitignore has no entry.
+    let reserved_patterns = [format!("{}/", GSD_DIR)];
+
+    // Keep gitignore semantics and ordering after GSD's reserved entries.
+    let patterns: Vec<String> = reserved_patterns
+        .iter()
+        .map(String::as_str)
+        .chain(gitignore_patterns.lines())
         .chain(gsdignore_patterns.lines())
         .chain(configured_patterns.iter().map(String::as_str))
         .map(str::trim)
@@ -388,7 +373,7 @@ async fn ensure_local_git_config(
     run_snapshot_git(repo, &["config", "user.name", author_name], None).await?;
     run_snapshot_git(repo, &["config", "user.email", author_email], None).await?;
     run_snapshot_git(repo, &["config", "commit.gpgsign", "false"], None).await?;
-    run_snapshot_git(repo, &["config", "gsd.workTree", work_tree.as_ref()], None).await?;
+    run_snapshot_git(repo, &["config", "core.worktree", work_tree.as_ref()], None).await?;
     Ok(())
 }
 
@@ -639,16 +624,36 @@ mod tests {
         assert!(repo.git_dir.exists());
         assert_eq!(
             repo.git_dir.file_name().unwrap().to_string_lossy(),
-            format!(
-                "{}",
-                snapshot_archive_name(&std::fs::canonicalize(&dir).unwrap())
-            )
+            snapshot_archive_name(&std::fs::canonicalize(&dir).unwrap())
         );
 
         let exclude = fs::read_to_string(repo.git_dir.join("info").join("exclude"))
             .await
             .unwrap();
+        assert!(exclude.contains(".gsd/"));
         assert!(exclude.contains("*.tmp"));
+    }
+
+    #[tokio::test]
+    async fn test_central_repo_ignores_existing_gsd_directory() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("target");
+        let archive_root = temp.path().join("archives");
+        fs::create_dir_all(dir.join(GSD_DIR)).await.unwrap();
+        fs::write(dir.join(GSD_DIR).join("old-history"), "old")
+            .await
+            .unwrap();
+        fs::write(dir.join("tracked.txt"), "tracked").await.unwrap();
+
+        let repo = ensure_repo_initialized(&dir, Some(&archive_root), "Test", "test@test.com", &[])
+            .await
+            .unwrap();
+
+        let tracked = run_snapshot_git(&repo, &["ls-files", "-z"], None)
+            .await
+            .unwrap();
+        assert!(tracked.stdout.contains("tracked.txt"));
+        assert!(!tracked.stdout.contains(".gsd/old-history"));
     }
 
     #[test]
@@ -657,6 +662,23 @@ mod tests {
         assert!(name.starts_with("--etc-systemd-system--."));
         assert!(name.ends_with(".git"));
         assert!(name.len() <= MAX_ARCHIVE_NAME_BYTES);
+    }
+
+    #[test]
+    fn test_snapshot_archive_name_for_root_path() {
+        let name = snapshot_archive_name(Path::new("/"));
+        assert!(name.starts_with("--root--."));
+        assert!(name.ends_with(".git"));
+    }
+
+    #[test]
+    fn test_snapshot_archive_name_truncates_before_hash_suffix() {
+        let long_path = format!("/{}", "long-segment/".repeat(40));
+        let name = snapshot_archive_name(Path::new(&long_path));
+
+        assert!(name.len() <= MAX_ARCHIVE_NAME_BYTES);
+        assert!(name.ends_with(".git"));
+        assert_eq!(name.matches(".git").count(), 1);
     }
 
     #[tokio::test]
